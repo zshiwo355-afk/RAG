@@ -1,0 +1,23 @@
+{
+  "name": "rag-visual-ingest",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "lint": "vue-tsc --noEmit",
+    "typecheck": "vue-tsc --noEmit",
+    "build": "vue-tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "element-plus": "^2.10.7",
+    "vite": "^5.4.21",
+    "vue": "^3.5.24",
+    "vue-router": "^4.6.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vue-tsc": "^2.2.12"
+  }
+}

@@ -1,0 +1,14 @@
+alibabacloud_ha3engine_vector==1.1.17
+fastapi
+uvicorn
+pydantic
+requests
+oss2
+openpyxl
+pandas
+pillow
+python-dotenv
+pypdf
+PyMuPDF
+pytest
+streamlit

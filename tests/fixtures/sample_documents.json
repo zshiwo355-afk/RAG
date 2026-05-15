@@ -1,0 +1,39 @@
+[
+  {
+    "page_content": "测试产品A 酒体饱满 适合离线测试",
+    "metadata": {
+      "doc_id": "doc_product_a",
+      "product_id": "prod_a",
+      "product_name": "测试产品A",
+      "doc_type": "product_full",
+      "field_name": "summary",
+      "source_kind": "product_excel",
+      "source_file": "素材/sample_product.xlsx",
+      "source_doc_id": "product__prod_a",
+      "source_sha1": "source-sha1-a"
+    }
+  },
+  {
+    "page_content": "测试产品A 包装信息",
+    "metadata": {
+      "doc_id": "doc_product_a_packaging",
+      "product_id": "prod_a",
+      "product_name": "测试产品A",
+      "doc_type": "product_field",
+      "field_name": "packaging_desc",
+      "source_kind": "product_excel",
+      "source_file": "素材/sample_product.xlsx",
+      "source_doc_id": "product__prod_a__packaging",
+      "source_sha1": "source-sha1-a"
+    }
+  },
+  {
+    "page_content": "",
+    "metadata": {
+      "doc_id": "doc_empty_text",
+      "product_id": "prod_empty",
+      "source_doc_id": "product__empty",
+      "source_sha1": "source-sha1-empty"
+    }
+  }
+]
