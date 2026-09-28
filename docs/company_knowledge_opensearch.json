@@ -1,0 +1,207 @@
+{
+  "schema": {
+    "table_name": "company_knowledge_hybrid",
+    "enable_ttl": false,
+    "user_defined_param": {},
+    "fields": [
+      {
+        "field_name": "id",
+        "field_type": "STRING",
+        "compress_type": "uniq"
+      },
+      {
+        "user_defined_param": {
+          "multi_value_sep": ","
+        },
+        "multi_value": true,
+        "compress_type": "uniq",
+        "field_type": "FLOAT",
+        "field_name": "source_text_vector"
+      },
+      {
+        "field_name": "knowledge_id",
+        "field_type": "STRING",
+        "compress_type": "uniq"
+      },
+      {
+        "field_name": "revision",
+        "field_type": "INT64",
+        "compress_type": "equal"
+      },
+      {
+        "field_name": "revision_key",
+        "field_type": "STRING",
+        "compress_type": "uniq"
+      },
+      {
+        "field_name": "chunk_id",
+        "field_type": "STRING",
+        "compress_type": "uniq"
+      },
+      {
+        "field_name": "chunk_index",
+        "field_type": "INT64",
+        "compress_type": "equal"
+      },
+      {
+        "field_name": "title",
+        "field_type": "STRING",
+        "compress_type": "uniq"
+      },
+      {
+        "field_name": "source_text",
+        "field_type": "STRING",
+        "compress_type": "uniq"
+      },
+      {
+        "field_name": "content_hash",
+        "field_type": "STRING",
+        "compress_type": "uniq"
+      },
+      {
+        "field_name": "title_terms",
+        "field_type": "TEXT",
+        "analyzer": "chn_standard"
+      },
+      {
+        "field_name": "text_terms",
+        "field_type": "TEXT",
+        "analyzer": "chn_standard"
+      }
+    ],
+    "indexs": [
+      {
+        "index_fields": [
+          {
+            "boost": 1,
+            "field_name": "id"
+          },
+          {
+            "boost": 1,
+            "field_name": "source_text_vector"
+          }
+        ],
+        "is_vector": true,
+        "indexer": "aitheta2_indexer",
+        "index_name": "source_text_vector",
+        "parameters": {
+          "enable_rt_build": "true",
+          "min_scan_doc_cnt": "20000",
+          "vector_index_type": "Qc",
+          "major_order": "col",
+          "builder_name": "QcBuilder",
+          "distance_type": "InnerProduct",
+          "embedding_delimiter": ",",
+          "enable_recall_report": "true",
+          "ignore_invalid_doc": "true",
+          "is_embedding_saved": "false",
+          "linear_build_threshold": "5000",
+          "dimension": "1024",
+          "rt_index_params": "{\"proxima.oswg.streamer.segment_size\":2048}",
+          "search_index_params": "{\"proxima.qc.searcher.scan_ratio\":0.01}",
+          "searcher_name": "QcSearcher",
+          "build_index_params": "{\"proxima.qc.builder.quantizer_class\":\"Int8QuantizerConverter\",\"proxima.qc.builder.quantize_by_centroid\":true,\"proxima.qc.builder.optimizer_class\":\"BruteForceBuilder\",\"proxima.qc.builder.thread_count\":10,\"proxima.qc.builder.optimizer_params\":{\"proxima.linear.builder.column_major_order\":true},\"proxima.qc.builder.store_original_features\":false,\"proxima.qc.builder.train_sample_count\":3000000,\"proxima.qc.builder.train_sample_ratio\":0.5}"
+        },
+        "index_type": "CUSTOMIZED"
+      },
+      {
+        "has_primary_key_attribute": true,
+        "index_fields": "id",
+        "is_primary_key_sorted": false,
+        "index_name": "id",
+        "index_type": "PRIMARYKEY64"
+      },
+      {
+        "index_name": "revision_key",
+        "index_type": "STRING",
+        "index_fields": "revision_key"
+      },
+      {
+        "index_name": "title_terms",
+        "index_type": "TEXT",
+        "index_fields": "title_terms"
+      },
+      {
+        "index_name": "text_terms",
+        "index_type": "TEXT",
+        "index_fields": "text_terms"
+      }
+    ],
+    "attributes": [
+      {
+        "field_name": "id",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "source_text_vector",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "knowledge_id",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "revision",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "revision_key",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "chunk_id",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "chunk_index",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "content_hash",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "title",
+        "file_compress": "no_compressor"
+      },
+      {
+        "field_name": "source_text",
+        "file_compress": "no_compressor"
+      }
+    ],
+    "summarys": {
+      "summary_fields": [
+        "id",
+        "source_text_vector",
+        "knowledge_id",
+        "revision",
+        "revision_key",
+        "chunk_id",
+        "chunk_index",
+        "title",
+        "source_text",
+        "content_hash"
+      ],
+      "parameter": {
+        "file_compressor": "zstd"
+      }
+    },
+    "file_compress": [
+      {
+        "name": "file_compressor",
+        "type": "zstd"
+      },
+      {
+        "name": "no_compressor",
+        "type": ""
+      }
+    ]
+  },
+  "extend": {
+    "description": [],
+    "vector": [
+      "source_text_vector"
+    ],
+    "embeding": []
+  }
+}

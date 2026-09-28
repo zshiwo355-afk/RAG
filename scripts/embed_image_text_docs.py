@@ -23,7 +23,7 @@ from urllib import request as urllib_request
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR_DIR = ROOT / ".vendor"
 if VENDOR_DIR.exists():
-    sys.path.insert(0, str(VENDOR_DIR))
+    sys.path.append(str(VENDOR_DIR))
 
 API_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"

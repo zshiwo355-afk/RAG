@@ -21,6 +21,17 @@ def fixture_dir() -> Path:
     return FIXTURES
 
 
+@pytest.fixture(autouse=True)
+def offline_rerank_no_network(request, monkeypatch):
+    if request.node.get_closest_marker("offline") is not None:
+        from rag_app import rerank_service
+
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("offline rerank fixture; tests may provide deterministic scores")
+
+        monkeypatch.setattr(rerank_service, "call_rerank_model", unavailable)
+
+
 @pytest.fixture
 def temp_project(tmp_path: Path, fixture_dir: Path) -> Path:
     root = tmp_path / "project"

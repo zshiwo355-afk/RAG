@@ -4,6 +4,7 @@ uvicorn
 pydantic
 requests
 oss2
+psycopg[binary]>=3.2,<4
 openpyxl
 pandas
 pillow
@@ -11,4 +12,5 @@ python-dotenv
 pypdf
 PyMuPDF
 pytest
+httpx
 streamlit

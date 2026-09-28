@@ -13,7 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROOT = PROJECT_ROOT
 VENDOR_DIR = PROJECT_ROOT / ".vendor"
 if VENDOR_DIR.exists() and str(VENDOR_DIR) not in sys.path:
-    sys.path.insert(0, str(VENDOR_DIR))
+    # Installed dependencies match the running Python; vendored binaries may not.
+    sys.path.append(str(VENDOR_DIR))
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
 VECTOR_DIMENSIONS = 1024
@@ -57,4 +58,3 @@ def truncate(text: str, limit: int = 120) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
-

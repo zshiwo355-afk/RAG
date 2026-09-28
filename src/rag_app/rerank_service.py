@@ -10,6 +10,7 @@ uses the real rerank score.
 from __future__ import annotations
 
 import os
+import math
 import re
 import sys
 import json
@@ -144,36 +145,31 @@ def call_rerank_model(query: str, documents: list[str]) -> list[float]:
     }
     response_payload = post_json(RERANK_API_URL, headers, payload)
 
-    if response_payload.get("code") or response_payload.get("message") and not response_payload.get("output"):
-        raise RuntimeError(
-            "百炼 rerank 调用失败："
-            + compact_json(response_payload)
-            + "。请到百炼控制台确认账号是否支持该 rerank 模型。"
-        )
+    if (not isinstance(response_payload, dict) or response_payload.get("code")
+            or response_payload.get("message") and not response_payload.get("output")):
+        raise RuntimeError("百炼 rerank 调用失败，请检查模型配置")
 
     output = response_payload.get("output") or {}
     results = output.get("results") if isinstance(output, dict) else None
-    if not isinstance(results, list):
-        raise RuntimeError(
-            f"百炼 rerank 响应缺少 output.results：{compact_json(response_payload)}。"
-            "请确认 RERANK_MODEL 是否为账号可用的文本排序模型。"
-        )
+    if not isinstance(results, list) or len(results) != len(documents):
+        raise RuntimeError("百炼 rerank 未返回完整候选分数")
 
     scores: list[float | None] = [None] * len(documents)
     for item in results:
         if not isinstance(item, dict):
-            continue
+            raise RuntimeError("百炼 rerank 候选分数格式无效")
         index = item.get("index")
         score = item.get("relevance_score")
-        if isinstance(index, int) and 0 <= index < len(documents):
-            try:
-                scores[index] = float(score)
-            except Exception:
-                scores[index] = 0.0
-
-    missing = [index for index, score in enumerate(scores) if score is None]
-    if missing:
-        raise RuntimeError(f"百炼 rerank 未返回全部候选分数，缺失 index={missing[:10]}")
+        if (type(index) is not int or not 0 <= index < len(documents)
+                or scores[index] is not None or type(score) not in (int, float)):
+            raise RuntimeError("百炼 rerank 候选分数格式无效")
+        try:
+            score = float(score)
+        except (ValueError, OverflowError):
+            raise RuntimeError("百炼 rerank 候选分数格式无效") from None
+        if not math.isfinite(score):
+            raise RuntimeError("百炼 rerank 候选分数格式无效")
+        scores[index] = score
     return [float(score) for score in scores]
 
 

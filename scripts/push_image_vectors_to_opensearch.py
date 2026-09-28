@@ -39,7 +39,7 @@ from source_identity import (
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR_DIR = ROOT / ".vendor"
 if VENDOR_DIR.exists():
-    sys.path.insert(0, str(VENDOR_DIR))
+    sys.path.append(str(VENDOR_DIR))
 
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_MAX_RETRIES = 3

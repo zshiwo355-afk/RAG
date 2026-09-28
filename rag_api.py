@@ -50,6 +50,11 @@ app.add_middleware(
 if visual_ingest_router is not None and hasattr(app, "include_router"):
     app.include_router(visual_ingest_router)
 
+if hasattr(app, "include_router"):
+    from rag_app.knowledge_api import router as knowledge_router
+
+    app.include_router(knowledge_router)
+
 REQUIRED_ENV = (
     "DASHSCOPE_API_KEY",
     "OPENSEARCH_ENDPOINT",
