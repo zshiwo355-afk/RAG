@@ -407,6 +407,28 @@ def source_row(key="KA-001", kind="Skill方法", state="交付", path="知识正
             "WorkBuddy：C:\\Users\\example\\private.md", "执行未验证", "仅分享方法，未批准发布", target]
 
 
+def test_source_v2_attaches_declared_asset_folder_without_markdown_links(tmp_path):
+    members = {
+        "包/交付清单.csv": source_csv([source_row()]),
+        "包/知识正文/KA-001.md": "# 方法\n附件在 ../附件/KA-001/ 下。参阅 `references/check.md`。",
+        "包/附件/KA-001/references/check.md": "# 检查\n保留来源。",
+        "包/附件/KA-001/templates/form.md": "# 表格\n失败原因与例外。",
+        "包/附件/KA-001/broken.docx": "not a docx",
+        "包/附件/KA-001/run.py": "NEVER_RUN",
+        "包/附件/KA-002/references/check.md": "# 另一资产\n不能合并。",
+    }
+    source = simple_archive(tmp_path, {key.replace('/', '\\'): value for key, value in members.items()})
+    out = tmp_path / "result"
+    asset = intake.process_batch([source], out)["assets"][0]
+    body = (out / asset["body_file"]).read_text()
+    assert "保留来源。" in body and "失败原因与例外。" in body
+    assert "不能合并。" not in body and "NEVER_RUN" not in body
+    codes = {issue["code"] for issue in asset["issues"]}
+    assert "unresolved_reference" not in codes
+    assert {"referenced_material_unparsed", "script_dependency_not_provided"} <= codes
+    assert asset["state"] == "repair_required"
+
+
 def test_source_v2_routes_only_deliveries_preserves_body_and_department(tmp_path):
     rows, members = [], {}
     for number, kind in enumerate(intake.SOURCE_TYPES, 1):
@@ -461,6 +483,12 @@ def test_source_v2_routes_only_deliveries_preserves_body_and_department(tmp_path
 @pytest.mark.parametrize("rows,code", [
     ([source_row(path="../知识正文/KA-001.md")], "source_manifest_unsafe_path"),
     ([source_row(path="C:\\private.md")], "source_manifest_unsafe_path"),
+    ([source_row(path="../知识正文/KA-001.docx")], "source_manifest_unsafe_path"),
+    ([source_row(path="C:\\private.docx")], "source_manifest_unsafe_path"),
+    ([source_row(path="/private.pdf")], "source_manifest_unsafe_path"),
+    ([source_row(path="知识正文/../private.pdf")], "source_manifest_unsafe_path"),
+    ([source_row(path="./private.pdf")], "source_manifest_unsafe_path"),
+    ([source_row(path="知识正文/legacy.doc")], "source_manifest_unsafe_path"),
     ([source_row(path="知识正文/missing.md")], "source_manifest_body_unavailable"),
     ([source_row(kind="不认识的类型")], "source_manifest_invalid_row"),
     ([source_row(), source_row()], "source_manifest_invalid_row"),
@@ -541,6 +569,11 @@ def test_inline_code_is_not_a_markdown_link_but_explicit_reference_paths_are_kep
             "双反引号 ``示例含 `反引号` 及 [示例](fake.md)``；"
             "真实[x](ref.md)，参考 `references/x.md` 和 ``templates/check.md``。")
     assert intake._references(text) == ["ref.md", "references/x.md", "templates/check.md"]
+
+
+def test_redacted_parentheticals_and_mcp_methods_are_not_missing_files():
+    text = "[姓名略](部门,8.2h) [姓名略](employee_id 42) `tools/list` `tools/call` [姓名略](references/a.md)"
+    assert intake._references(text) == ["references/a.md"]
 
 
 def reviewed_missing_method(tmp_path, *, review_changes=None, kind="Skill方法", legacy=False, extra=None):

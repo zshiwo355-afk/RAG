@@ -6,6 +6,7 @@ KNOWLEDGE_TEST_DATABASE_URL=postgresql://... python3 -m pytest -q tests/test_kno
 
 from concurrent.futures import ThreadPoolExecutor
 import os
+import threading
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -70,6 +71,51 @@ def test_postgres_initialization_concurrency_and_withdrawal(monkeypatch):
             store.publish("pg-example", 2, expected_generation=latest["generation"], confirmed_by="测试")
         assert store.get_published("pg-example") is None
         assert store.published_revisions() == []
+
+        automatic = store.import_draft({**entry, "knowledge_id": "pg-automatic"})
+        with store._connection(write=True) as connection:
+            connection.execute("CREATE TABLE publication_outcomes (id TEXT PRIMARY KEY)")
+            connection.execute("CREATE TABLE publication_lease (expires DOUBLE PRECISION)")
+            connection.execute("INSERT INTO publication_lease VALUES (EXTRACT(EPOCH FROM clock_timestamp()) + 60)")
+
+        def guard(connection):
+            lease = connection.execute("SELECT expires > EXTRACT(EPOCH FROM clock_timestamp()) AS valid FROM publication_lease FOR UPDATE").fetchone()
+            if not lease["valid"]:
+                raise RuntimeError("lease expired")
+
+        def complete(connection, published):
+            connection.execute("INSERT INTO publication_outcomes VALUES ('job-a')")
+            raise RuntimeError("completion failed")
+
+        with pytest.raises(RuntimeError, match="completion failed"):
+            store.publish_automatic("pg-automatic", 1, expected_generation=automatic["generation"],
+                                    confirmed_by="rule:v1", transaction_guard=guard, transaction_complete=complete)
+        assert store.get_published("pg-automatic") is None
+        with store._connection() as connection:
+            assert connection.execute("SELECT COUNT(*) AS n FROM publication_outcomes").fetchone()["n"] == 0
+
+        waiting = threading.Event()
+
+        class WaitingStore(KnowledgeStore):
+            def _lock(self, connection, knowledge_id):
+                if knowledge_id == "pg-automatic":
+                    waiting.set()
+                super()._lock(connection, knowledge_id)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with store._connection(write=True) as connection:
+                store._lock(connection, "pg-automatic")
+                future = pool.submit(
+                    WaitingStore(database_url=test_url).publish_automatic,
+                    "pg-automatic", 1, expected_generation=automatic["generation"],
+                    confirmed_by="rule:v1", transaction_guard=guard,
+                )
+                assert waiting.wait(timeout=10)
+                connection.execute("UPDATE publication_lease SET expires=0")
+            with pytest.raises(RuntimeError, match="lease expired"):
+                future.result(timeout=10)
+        assert store.snapshot("pg-automatic") == automatic
+        assert store.get_published("pg-automatic") is None
     finally:
         admin.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
         admin.close()

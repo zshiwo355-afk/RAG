@@ -14,10 +14,29 @@ from rag_app import config, rerank_service
 from rag_app.knowledge_api import get_knowledge_service, router
 from rag_app.knowledge_index import chunk_document
 from rag_app.knowledge_service import KnowledgeService
-from rag_app.knowledge_store import KnowledgeStore
+from rag_app.knowledge_store import AutomaticPublicationConflict, KnowledgeStore
 
 
 pytestmark = pytest.mark.offline
+
+
+@pytest.mark.parametrize("configured_key", [None, "legacy-key-still-in-env"])
+def test_knowledge_reads_need_no_api_key(service, monkeypatch, configured_key):
+    if configured_key is None:
+        monkeypatch.delenv("KNOWLEDGE_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("KNOWLEDGE_API_KEY", configured_key)
+    service.import_document(entry(), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_knowledge_service] = lambda: service
+    with TestClient(app) as client:
+        search = client.post("/api/knowledge/search", json={"query": "复盘"})
+        detail = client.get("/api/knowledge/decision-review?revision=1")
+        assert search.status_code == detail.status_code == 200
+        assert search.json()["results"][0]["content"] == detail.json()["knowledge"]["content"]
+        assert "answer" not in search.json()
 
 
 def entry(content="先确认问题，再收集证据，最后比较方案。"):
@@ -37,13 +56,13 @@ class FakeIndex:
         self.on_publish = None
         self.on_search = None
 
-    def index_and_verify(self, record):
+    def index_and_verify(self, record, *, require_keyword=False):
         if self.fail:
             raise RuntimeError("模拟新版本写后缺块")
         self.rows.extend({**chunk, "score": 0.8} for chunk in chunk_document(record))
         if self.on_publish:
             self.on_publish()
-        return {"verified_chunks": len(chunk_document(record))}
+        return {"verified_chunks": len(chunk_document(record)), "keyword_retrieval_verified": require_keyword}
 
     def search(self, query, allowed_versions, top_k):
         self.search_calls.append((query, deepcopy(allowed_versions), top_k))
@@ -56,6 +75,106 @@ class FakeIndex:
 @pytest.fixture
 def service(tmp_path):
     return KnowledgeService(KnowledgeStore(tmp_path / "knowledge.sqlite3"), FakeIndex())
+
+
+def test_automatic_publication_atomically_completes_and_recovers_without_republishing(service):
+    draft = service.import_document(entry(), execute=True)
+    with service.store._connection(write=True) as connection:
+        connection.execute("CREATE TABLE automatic_outcomes (id TEXT PRIMARY KEY, revision INTEGER)")
+    calls = []
+
+    def guard(connection):
+        calls.append("guard")
+        assert connection.execute("SELECT COUNT(*) FROM knowledge_assets").fetchone()[0] == 1
+
+    def complete(connection, published, verification):
+        assert verification["keyword_retrieval_verified"] is True
+        assert connection.execute("SELECT published_revision FROM knowledge_assets").fetchone()[0] == 1
+        connection.execute("INSERT INTO automatic_outcomes VALUES ('job-a', ?) ON CONFLICT(id) DO NOTHING", (published["revision"],))
+        calls.append("complete")
+
+    first = service.publish_automatic("decision-review", 1, expected_generation=draft["generation"],
+                                      confirmed_by="rule:v1", transaction_guard=guard, transaction_complete=complete)
+    retried = service.publish_automatic("decision-review", 1, expected_generation=draft["generation"],
+                                        confirmed_by="rule:v2", transaction_guard=guard, transaction_complete=complete)
+    assert first == retried
+    assert retried["knowledge"]["confirmed_by"] == "rule:v1"
+    assert service.store.snapshot("decision-review")["generation"] == draft["generation"] + 1
+    assert calls == ["guard", "complete", "guard", "complete"]
+    with service.store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM automatic_outcomes").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("failure", ["lease", "completion"])
+def test_automatic_publication_callback_failure_rolls_back_pointer_and_processing_writes(service, failure):
+    first = service.import_document(entry(), execute=True)
+    service.publish("decision-review", confirmed_by="old reviewer", execute=True)
+    draft = service.import_document(entry("第二版正文"), execute=True)
+    previous = service.store.get_published("decision-review")
+    with service.store._connection(write=True) as connection:
+        connection.execute("CREATE TABLE automatic_outcomes (id TEXT PRIMARY KEY)")
+
+    def guard(connection):
+        if failure == "lease":
+            raise RuntimeError("processing lease expired")
+
+    def complete(connection, published, verification):
+        connection.execute("INSERT INTO automatic_outcomes VALUES ('job-a')")
+        raise RuntimeError("processing completion failed")
+
+    with pytest.raises(RuntimeError, match="processing"):
+        service.publish_automatic("decision-review", 2, expected_generation=draft["generation"], confirmed_by="rule:v1",
+                                  transaction_guard=guard, transaction_complete=complete)
+    assert service.store.get_published("decision-review") == previous
+    assert service.store.snapshot("decision-review") == draft
+    with service.store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM automatic_outcomes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("operation", ["withdraw", "new_revision"])
+def test_automatic_publication_rechecks_version_after_indexing(service, operation):
+    draft = service.import_document(entry(), execute=True)
+    service.index.on_publish = (lambda: service.withdraw("decision-review", execute=True)) if operation == "withdraw" else (
+        lambda: service.import_document(entry("更新草稿"), execute=True))
+    with pytest.raises(AutomaticPublicationConflict, match="changed|latest"):
+        service.publish_automatic("decision-review", 1, expected_generation=draft["generation"], confirmed_by="rule:v1")
+    assert service.store.get_published("decision-review") is None
+
+
+def test_automatic_publication_never_rolls_back_but_manual_publication_still_can(service):
+    first = service.import_document(entry(), execute=True)
+    service.publish_automatic("decision-review", 1, expected_generation=first["generation"], confirmed_by="rule:v1")
+    second = service.import_document(entry("第二版正文"), execute=True)
+    service.publish_automatic("decision-review", 2, expected_generation=second["generation"], confirmed_by="rule:v1")
+    current = service.store.snapshot("decision-review")
+    with pytest.raises(AutomaticPublicationConflict, match="changed"):
+        service.publish_automatic("decision-review", 1, expected_generation=current["generation"], confirmed_by="rule:v1")
+    assert service.store.get_published("decision-review")["revision"] == 2
+    service.publish("decision-review", 1, confirmed_by="explicit rollback reviewer", execute=True)
+    assert service.store.get_published("decision-review")["revision"] == 1
+
+
+def test_automatic_published_retry_cannot_complete_after_a_new_candidate_exists(service):
+    first = service.import_document(entry(), execute=True)
+    service.publish_automatic("decision-review", 1, expected_generation=first["generation"], confirmed_by="rule:v1")
+    service.import_document(entry("第二版草稿"), execute=True)
+    completed = []
+    with pytest.raises(AutomaticPublicationConflict, match="changed|latest"):
+        service.publish_automatic("decision-review", 1, expected_generation=first["generation"], confirmed_by="rule:v1",
+                                  transaction_complete=lambda *args: completed.append(True))
+    assert completed == []
+    assert service.store.get_published("decision-review")["revision"] == 1
+
+
+def test_automatic_retry_after_withdrawal_and_manual_republication_is_a_conflict(service):
+    draft = service.import_document(entry(), execute=True)
+    service.publish_automatic("decision-review", 1, expected_generation=draft["generation"], confirmed_by="rule:v1")
+    service.withdraw("decision-review", execute=True)
+    service.publish("decision-review", 1, confirmed_by="explicit reviewer", execute=True)
+    current = service.store.get_published("decision-review")
+    with pytest.raises(AutomaticPublicationConflict):
+        service.publish_automatic("decision-review", 1, expected_generation=draft["generation"], confirmed_by="rule:v1")
+    assert service.store.get_published("decision-review") == current
 
 
 def test_default_dry_run_has_no_persistence_or_index_side_effects(service):

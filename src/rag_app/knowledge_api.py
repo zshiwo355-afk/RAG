@@ -1,4 +1,4 @@
-"""Unauthenticated, read-only access to published company knowledge."""
+"""Read-only access to published company knowledge."""
 
 from __future__ import annotations
 

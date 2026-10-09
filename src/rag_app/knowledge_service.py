@@ -10,7 +10,7 @@ from typing import Any, Optional
 from . import rerank_service
 from .config import load_env
 from .knowledge_index import KnowledgeIndex, chunk_document
-from .knowledge_store import KnowledgeStore, normalize_entry
+from .knowledge_store import AutomaticPublicationConflict, KnowledgeStore, normalize_entry
 
 
 PUBLIC_FIELDS = (
@@ -92,6 +92,39 @@ class KnowledgeService:
         published = self.store.publish(
             knowledge_id, snapshot["revision"], expected_generation=snapshot["generation"],
             confirmed_by=confirmed_by.strip(),
+        )
+        return {"status": "published", "knowledge": public_record(published), "verification": verification}
+
+    def publish_automatic(
+        self, knowledge_id: str, revision: int, *, expected_generation: int, confirmed_by: str,
+        transaction_guard=None, transaction_complete=None,
+    ) -> dict[str, Any]:
+        """Execute a pinned processing decision; this path cannot roll back versions.
+
+        transaction_guard(connection) validates the lease after the knowledge lock.
+        transaction_complete(connection, published, verification) persists the
+        processing outcome atomically with the publication pointer.
+        """
+        if not isinstance(confirmed_by, str) or not confirmed_by.strip() or len(confirmed_by) > 200:
+            raise ValueError("发布需要提供有效 confirmed_by（不超过 200 字符）")
+        if type(expected_generation) is not int or expected_generation < 1:
+            raise ValueError("expected_generation must be a positive integer")
+        if type(revision) is not int or not 1 <= revision <= 2**63 - 1:
+            raise ValueError("revision must be a positive int64")
+        if any(callback is not None and not callable(callback)
+               for callback in (transaction_guard, transaction_complete)):
+            raise ValueError("publication transaction callbacks must be callable")
+        snapshot = self.store.snapshot(knowledge_id, revision)
+        if (snapshot["status"] == "published" and snapshot["generation"] != expected_generation + 1
+                or snapshot["status"] != "published" and (
+                    snapshot["status"] != "draft" or snapshot["generation"] != expected_generation)):
+            raise AutomaticPublicationConflict("knowledge changed before automatic publication")
+        verification = self.index.index_and_verify(snapshot, require_keyword=True)
+        published = self.store.publish_automatic(
+            knowledge_id, revision, expected_generation=expected_generation, confirmed_by=confirmed_by.strip(),
+            transaction_guard=transaction_guard,
+            transaction_complete=(lambda connection, record: transaction_complete(connection, record, verification))
+            if transaction_complete is not None else None,
         )
         return {"status": "published", "knowledge": public_record(published), "verification": verification}
 

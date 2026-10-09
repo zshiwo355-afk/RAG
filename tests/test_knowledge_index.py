@@ -273,6 +273,43 @@ def test_full_batch_write_fetch_query_and_idempotent_retry(cloud):
     assert calls["client"] == 1
 
 
+def test_automatic_publication_verifies_dense_keyword_and_every_chunk(cloud, tmp_path):
+    from rag_app.knowledge_service import KnowledgeService
+    from rag_app.knowledge_store import KnowledgeStore
+
+    fake, calls, _ = cloud
+    service = KnowledgeService(KnowledgeStore(tmp_path / "catalog.sqlite3"), index.KnowledgeIndex())
+    draft = service.import_document({**record(content="方法" * 4500), "sources": [{"name": "离线样本"}]}, execute=True)
+    result = service.publish_automatic("method-a", 1, expected_generation=draft["generation"], confirmed_by="rule:v1")
+    assert result["verification"]["keyword_retrieval_verified"] is True
+    assert result["verification"]["retrieval_verified"] is True
+    assert result["verification"]["verified_chunk_ids"] == [chunk["id"] for chunk in index.chunk_document(draft)]
+    assert [op for op, _, _ in fake.calls][-2:] == ["query", "search"]
+    assert service.get("method-a")["content"] == draft["content"]
+
+
+@pytest.mark.parametrize("failure", ["error", "empty", "wrong_fields"])
+def test_automatic_keyword_verification_failure_never_publishes(cloud, tmp_path, failure):
+    from rag_app.knowledge_service import KnowledgeService
+    from rag_app.knowledge_store import KnowledgeStore
+
+    fake, calls, _ = cloud
+    if failure == "error":
+        fake.keyword_error = True
+    elif failure == "empty":
+        fake.keyword_hits = []
+    else:
+        fake.keyword_hits = [{"fields": {**index.chunk_document(record())[0], "source_text": "wrong"}, "score": 1.0}]
+    service = KnowledgeService(KnowledgeStore(tmp_path / "catalog.sqlite3"), index.KnowledgeIndex())
+    draft = service.import_document({**record(), "sources": [{"name": "离线样本"}]}, execute=True)
+    with pytest.raises(index.KnowledgeIndexError):
+        service.publish_automatic("method-a", 1, expected_generation=draft["generation"], confirmed_by="rule:v1")
+    assert service.store.snapshot("method-a") == draft
+    assert service.get("method-a") is None
+    assert len(calls["embeddings"]) == 1
+    assert len([op for op, _, _ in fake.calls if op == "push"]) == 1
+
+
 @pytest.mark.parametrize("fetch_delay,query_delay", [(5, 7), (30, 0), (0, 30)])
 def test_eventual_fetch_and_query_visibility_is_retried_without_rewriting(cloud, monkeypatch, fetch_delay, query_delay):
     fake, calls, _ = cloud

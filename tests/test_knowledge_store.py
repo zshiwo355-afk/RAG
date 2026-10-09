@@ -38,6 +38,25 @@ def test_import_is_idempotent_and_metadata_creates_immutable_revision(tmp_path):
     assert json.loads(json.dumps(second, ensure_ascii=False)) == second
 
 
+def test_shared_draft_import_commits_with_caller_state_or_rolls_back_together(tmp_path):
+    store = KnowledgeStore(tmp_path / "catalog.sqlite3")
+    store.initialize()
+    payload = normalize_entry(draft())
+    with pytest.raises(RuntimeError, match="caller failed"):
+        with store._connection(write=True) as connection:
+            store._lock(connection, payload["knowledge_id"])
+            store._import_draft(connection, payload, payload["payload_hash"])
+            raise RuntimeError("caller failed")
+    assert store.list_assets() == []
+    with store._connection(write=True) as connection:
+        store._lock(connection, payload["knowledge_id"])
+        imported = store._import_draft(connection, payload, payload["payload_hash"])
+        connection.execute("CREATE TABLE submission_binding (knowledge_id TEXT)")
+        connection.execute("INSERT INTO submission_binding VALUES (?)", (imported["knowledge_id"],))
+    assert store.snapshot("meeting-01") == imported
+    assert store.import_draft(draft()) == imported
+
+
 @pytest.mark.parametrize("changes", [
     {"title": "更新标题"}, {"contributor": "另一贡献者"}, {"kind": "case"},
     {"sources": [{"name": "新来源"}]}, {"content": "更新正文"},
@@ -292,6 +311,34 @@ def test_withdrawal_during_object_read_blocks_body_and_inflight_publication(tmp_
     assert published["content"] == draft()["content"]
 
 
+@pytest.mark.parametrize("action", ["draft", "replace", "withdraw", "withdraw_republish"])
+def test_public_read_survives_new_draft_but_not_publication_changes(tmp_path, action):
+    store = KnowledgeStore(tmp_path / "catalog.sqlite3", objects=MemoryObjects())
+    store.import_draft(draft())
+    original = store.publish("meeting-01", 1, expected_generation=1, confirmed_by="reviewer")
+
+    def change_during_read():
+        if action in {"withdraw", "withdraw_republish"}:
+            store.withdraw("meeting-01")
+            if action == "withdraw_republish":
+                snapshot = store.snapshot("meeting-01", 1)
+                store.publish("meeting-01", 1, expected_generation=snapshot["generation"], confirmed_by="reviewer")
+        else:
+            newer = store.import_draft(draft(content="更新后的内容"))
+            if action == "replace":
+                store.publish("meeting-01", newer["revision"], expected_generation=newer["generation"], confirmed_by="reviewer")
+
+    store.objects.before_read = change_during_read
+    current = store.get_published("meeting-01")
+    if action == "draft":
+        assert current is not None
+        assert current["revision"] == original["revision"] and current["content"] == original["content"]
+        assert current["published_at"] == original["published_at"]
+    else:
+        assert current is None
+    assert store.published_count() == len(store.published_catalog()) == (0 if action == "withdraw" else 1)
+
+
 def test_catalogue_filters_published_metadata_without_loading_any_body(tmp_path):
     objects = MemoryObjects()
     store = KnowledgeStore(tmp_path / "catalog.sqlite3", objects=objects)
@@ -309,6 +356,33 @@ def test_catalogue_filters_published_metadata_without_loading_any_body(tmp_path)
     assert objects.reads == reads
     store.withdraw("meeting-01")
     assert store.published_revisions(department="运营") == []
+    assert objects.reads == reads
+
+
+def test_public_catalog_uses_current_revision_and_only_public_relationship_targets(tmp_path):
+    objects = MemoryObjects()
+    store = KnowledgeStore(tmp_path / "catalog.sqlite3", objects=objects)
+    for key, published in (("meeting-01", True), ("case-01", True), ("private-01", False)):
+        record = store.import_draft(draft(knowledge_id=key, department="运营", scenarios=["复盘"],
+            evidence={"source_type": "Skill方法", "uploader_position": "不能信任的上传自述",
+                      "private_field": "private-value", "related_assets": [
+                {"knowledge_id": "case-01", "source_locator": "private-location"},
+                {"knowledge_id": "private-01"}, {"knowledge_id": "meeting-01"}]}))
+        if published:
+            store.publish(key, record["revision"], expected_generation=record["generation"], confirmed_by="reviewer")
+    store.import_draft(draft(title="未公开的新标题", kind="case"))
+    reads = objects.reads
+    catalog = {item["knowledge_id"]: item for item in store.published_catalog()}
+    assert set(catalog) == {"meeting-01", "case-01"}
+    assert catalog["meeting-01"]["title"] == "会议准备方法"
+    assert catalog["meeting-01"]["revision"] == 1
+    assert catalog["meeting-01"]["related_knowledge_ids"] == ["case-01"]
+    assert catalog["meeting-01"]["scenarios"] == ["复盘"]
+    assert catalog["meeting-01"]["uploader_position"] is None
+    assert "private" not in json.dumps(catalog) and "content" not in catalog["meeting-01"]
+    assert objects.reads == reads
+    store.withdraw("case-01")
+    assert store.published_catalog()[0]["related_knowledge_ids"] == []
     assert objects.reads == reads
 
 

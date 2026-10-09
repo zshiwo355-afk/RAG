@@ -239,7 +239,9 @@ class KnowledgeIndex:
             raise KnowledgeIndexError("company knowledge keyword query returned invalid results") from None
         return rows
 
-    def index_and_verify(self, record: dict[str, Any]) -> dict[str, Any]:
+    def index_and_verify(self, record: dict[str, Any], *, require_keyword: bool = False) -> dict[str, Any]:
+        if type(require_keyword) is not bool:
+            raise ValueError("require_keyword must be a boolean")
         chunks = chunk_document(record)
         self._connect()
         data_source = self._datasource()
@@ -283,6 +285,7 @@ class KnowledgeIndex:
             raise KnowledgeIndexError("company knowledge write verification failed; revision was not published")
 
         recalled = False
+        keyword_recalled = not require_keyword
         # Share at most 30 seconds of visibility waits across fetch and query;
         # network timeouts are separate. Neither phase repeats embedding/push.
         remaining_attempts = VERIFY_ATTEMPTS - attempt
@@ -290,17 +293,24 @@ class KnowledgeIndex:
             hits = self._query(vectors[0], [chunks[0]["revision_key"]], min(10, len(chunks)))
             recalled = any(isinstance(hit.get("id"), str) and hit["id"] in expected and all(hit.get(key) == value
                            for key, value in expected[hit["id"]].items()) for hit in hits)
-            if recalled:
+            if require_keyword and not keyword_recalled:
+                hits = self._query_keyword(chunks[0]["title"], [chunks[0]["revision_key"]], min(10, len(chunks)))
+                keyword_recalled = any(isinstance(hit.get("id"), str) and hit["id"] in expected and all(hit.get(key) == value
+                                       for key, value in expected[hit["id"]].items()) for hit in hits)
+            if recalled and keyword_recalled:
                 break
             if attempt + 1 < remaining_attempts:
                 time.sleep(VERIFY_RETRY_DELAY)
         if not recalled:
             raise KnowledgeIndexError("company knowledge retrieval verification failed; revision was not published")
+        if not keyword_recalled:
+            raise KnowledgeIndexError("company knowledge keyword verification failed; revision was not published")
         return {
             "table": self.table, "data_source": data_source,
             "knowledge_id": record["knowledge_id"], "revision": record["revision"],
             "chunk_count": len(chunks), "verified_chunk_ids": list(expected),
             "retrieval_verified": True,
+            "keyword_retrieval_verified": require_keyword,
         }
 
     def search(self, query: str, allowed_versions: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:

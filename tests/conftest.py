@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import socket
 from pathlib import Path
 import sys
 
@@ -19,6 +21,28 @@ for path in [REPO_ROOT, REPO_ROOT / "scripts", REPO_ROOT / "src"]:
 @pytest.fixture
 def fixture_dir() -> Path:
     return FIXTURES
+
+
+@pytest.fixture(autouse=True)
+def isolate_unit_tests_from_cloud(request, monkeypatch):
+    if request.node.get_closest_marker("integration") is not None:
+        return
+    # CLI dry-runs can load .env, changing a later SQLite test into an OSS write.
+    # The environment flag also reaches subprocess checks using python-dotenv.
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    for name in tuple(os.environ):
+        if name.startswith(("KNOWLEDGE_", "OSS_", "OPENSEARCH_", "DASHSCOPE_")):
+            monkeypatch.delenv(name, raising=False)
+
+    def guarded(original):
+        def no_network(connection, *args, **kwargs):
+            if connection.family in {socket.AF_INET, socket.AF_INET6}:
+                raise RuntimeError("unit tests must inject network clients; live checks require integration opt-in")
+            return original(connection, *args, **kwargs)
+        return no_network
+
+    for method in ("connect", "connect_ex"):
+        monkeypatch.setattr(socket.socket, method, guarded(getattr(socket.socket, method)))
 
 
 @pytest.fixture(autouse=True)

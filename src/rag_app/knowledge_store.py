@@ -117,6 +117,10 @@ _SCHEMA = (
 )
 
 
+class AutomaticPublicationConflict(RuntimeError):
+    """A pinned processing decision no longer matches the current catalogue."""
+
+
 class KnowledgeStore:
     def __init__(self, path=None, *, database_url=None, objects=None):
         if path is not None and database_url is not None:
@@ -265,38 +269,47 @@ class KnowledgeStore:
         payload = normalize_entry(entry)
         knowledge_id = payload["knowledge_id"]
         payload_hash = payload["payload_hash"]
-        stored_payload = dict(payload)
+        ref = None
         if self.body_storage == "oss":
             # Upload and verify before opening a catalogue transaction. A failed
             # write must never create a revision pointing at an unreadable body.
             ref = self._objects().put(payload["content"])
-            if ref["sha256"] != payload["content_hash"] or ref["byte_length"] != len(payload["content"].encode("utf-8")):
-                raise RuntimeError("company knowledge body reference does not match its content")
-            stored_payload.pop("content")
-            stored_payload["content_ref"] = ref
         with self._connection(write=True) as connection:
             self._lock(connection, knowledge_id)
-            asset = self._execute(connection, "SELECT * FROM knowledge_assets WHERE knowledge_id = ?", (knowledge_id,)).fetchone()
-            if asset:
-                latest = self._record(connection, knowledge_id, asset["latest_revision"], hydrate=False)
-                if latest["payload_hash"] == payload_hash:
-                    latest.pop("content_ref", None)
-                    return {**latest, "content": payload["content"], "generation": asset["generation"]}
-                if not allow_new_revision:
-                    raise ValueError("batch import cannot create a new revision of an existing asset")
-            revision = asset["latest_revision"] + 1 if asset else 1
-            generation = asset["generation"] + 1 if asset else 1
-            record = {
-                **stored_payload, "revision": revision,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._execute(connection, "INSERT INTO knowledge_revisions (knowledge_id, revision, payload_hash, record_json) VALUES (?, ?, ?, ?)", (knowledge_id, revision, payload_hash, _json(record)))
-            if asset:
-                self._execute(connection, "UPDATE knowledge_assets SET latest_revision = ?, generation = ?, status = CASE WHEN published_revision IS NULL THEN 'draft' ELSE 'published' END WHERE knowledge_id = ?", (revision, generation, knowledge_id))
-            else:
-                self._execute(connection, "INSERT INTO knowledge_assets (knowledge_id, latest_revision, generation) VALUES (?, ?, ?)", (knowledge_id, revision, generation))
-            record.pop("content_ref", None)
-            return {**record, "content": payload["content"], "generation": generation, "status": "draft", "confirmed_by": None, "published_at": None}
+            return self._import_draft(connection, payload, payload_hash, ref, allow_new_revision=allow_new_revision)
+
+    def _import_draft(self, connection, payload, payload_hash, content_ref=None, *, allow_new_revision=True):
+        """Import a normalized, verified body into the caller's locked transaction."""
+        if type(allow_new_revision) is not bool or payload_hash != payload["payload_hash"]:
+            raise ValueError("invalid normalized draft")
+        knowledge_id = payload["knowledge_id"]
+        stored_payload = dict(payload)
+        if content_ref is not None:
+            if (content_ref["sha256"] != payload["content_hash"]
+                    or content_ref["byte_length"] != len(payload["content"].encode("utf-8"))):
+                raise RuntimeError("company knowledge body reference does not match its content")
+            stored_payload.pop("content")
+            stored_payload["content_ref"] = content_ref
+        elif self.body_storage == "oss":
+            raise ValueError("OSS draft requires a verified body reference")
+        asset = self._execute(connection, "SELECT * FROM knowledge_assets WHERE knowledge_id = ?", (knowledge_id,)).fetchone()
+        if asset:
+            latest = self._record(connection, knowledge_id, asset["latest_revision"], hydrate=False)
+            if latest["payload_hash"] == payload_hash:
+                latest.pop("content_ref", None)
+                return {**latest, "content": payload["content"], "generation": asset["generation"]}
+            if not allow_new_revision:
+                raise ValueError("batch import cannot create a new revision of an existing asset")
+        revision = asset["latest_revision"] + 1 if asset else 1
+        generation = asset["generation"] + 1 if asset else 1
+        record = {**stored_payload, "revision": revision, "created_at": datetime.now(timezone.utc).isoformat()}
+        self._execute(connection, "INSERT INTO knowledge_revisions (knowledge_id, revision, payload_hash, record_json) VALUES (?, ?, ?, ?)", (knowledge_id, revision, payload_hash, _json(record)))
+        if asset:
+            self._execute(connection, "UPDATE knowledge_assets SET latest_revision = ?, generation = ?, status = CASE WHEN published_revision IS NULL THEN 'draft' ELSE 'published' END WHERE knowledge_id = ?", (revision, generation, knowledge_id))
+        else:
+            self._execute(connection, "INSERT INTO knowledge_assets (knowledge_id, latest_revision, generation) VALUES (?, ?, ?)", (knowledge_id, revision, generation))
+        record.pop("content_ref", None)
+        return {**record, "content": payload["content"], "generation": generation, "status": "draft", "confirmed_by": None, "published_at": None}
 
     def snapshot(self, knowledge_id, revision=None) -> dict:
         knowledge_id = _knowledge_id(knowledge_id)
@@ -320,11 +333,54 @@ class KnowledgeStore:
             asset = self._asset(connection, knowledge_id)
             if asset["generation"] != expected_generation:
                 raise RuntimeError("knowledge changed during publication; take a fresh snapshot and publish again")
-            published_at = datetime.now(timezone.utc).isoformat()
-            generation = expected_generation + 1
-            self._execute(connection, "UPDATE knowledge_revisions SET was_published = 1, confirmed_by = ?, published_at = ? WHERE knowledge_id = ? AND revision = ?", (confirmed_by, published_at, knowledge_id, revision))
-            self._execute(connection, "UPDATE knowledge_assets SET published_revision = ?, generation = ?, confirmed_by = ?, published_at = ?, status = 'published' WHERE knowledge_id = ?", (revision, generation, confirmed_by, published_at, knowledge_id))
-            return {**record, "generation": generation, "confirmed_by": confirmed_by, "published_at": published_at, "status": "published"}
+            return self._publish(connection, record, expected_generation, confirmed_by)
+
+    def _publish(self, connection, record, generation, confirmed_by):
+        knowledge_id, revision = record["knowledge_id"], record["revision"]
+        published_at = datetime.now(timezone.utc).isoformat()
+        generation += 1
+        self._execute(connection, "UPDATE knowledge_revisions SET was_published = 1, confirmed_by = ?, published_at = ? WHERE knowledge_id = ? AND revision = ?", (confirmed_by, published_at, knowledge_id, revision))
+        self._execute(connection, "UPDATE knowledge_assets SET published_revision = ?, generation = ?, confirmed_by = ?, published_at = ?, status = 'published' WHERE knowledge_id = ?", (revision, generation, confirmed_by, published_at, knowledge_id))
+        return {**record, "generation": generation, "confirmed_by": confirmed_by, "published_at": published_at, "status": "published"}
+
+    def publish_automatic(self, knowledge_id, revision, *, expected_generation, confirmed_by,
+                          transaction_guard=None, transaction_complete=None):
+        """Commit the latest candidate and its processing result in one transaction.
+
+        guard only validates the processing lease after the knowledge lock. It
+        must not acquire a preceding governance lock or perform remote I/O.
+        complete(connection, published) must only write through that connection.
+        """
+        knowledge_id = _knowledge_id(knowledge_id)
+        confirmed_by = _text(confirmed_by, "confirmed_by")
+        if type(expected_generation) is not int or expected_generation < 1:
+            raise ValueError("expected_generation must be a positive integer")
+        if type(revision) is not int or not 1 <= revision <= 2**63 - 1:
+            raise ValueError("revision must be a positive int64")
+        record = self.snapshot(knowledge_id, revision)
+        with self._connection(write=True) as connection:
+            # Match governance imports so cross-source publication checks remain
+            # stable across automatic publishers until the pointer is committed.
+            self._lock(connection, "write:knowledge-governance")
+            self._lock(connection, knowledge_id)
+            if transaction_guard is not None:
+                transaction_guard(connection)
+            asset = self._asset(connection, knowledge_id)
+            if asset["latest_revision"] != revision:
+                raise AutomaticPublicationConflict("automatic publication requires the latest revision")
+            if asset["published_revision"] == revision:
+                # Recovery must not increment the generation or replace attribution.
+                if asset["generation"] != expected_generation + 1:
+                    raise AutomaticPublicationConflict("knowledge changed after automatic publication")
+                published = {**record, "generation": asset["generation"], "status": "published",
+                             "confirmed_by": asset["confirmed_by"], "published_at": asset["published_at"]}
+            else:
+                if asset["generation"] != expected_generation or record["status"] != "draft":
+                    raise AutomaticPublicationConflict("knowledge changed during automatic publication")
+                published = self._publish(connection, record, expected_generation, confirmed_by)
+            if transaction_complete is not None:
+                transaction_complete(connection, published)
+            return published
 
     def withdraw(self, knowledge_id) -> dict:
         knowledge_id = _knowledge_id(knowledge_id)
@@ -353,9 +409,83 @@ class KnowledgeStore:
         # a SQLite snapshot nor an earlier publication pointer authorizes it.
         with self._connection() as connection:
             current = self._asset(connection, knowledge_id)
-            if current["published_revision"] != record["revision"] or current["generation"] != record["generation"]:
+            # A new private draft changes generation, not the public version.
+            if (current["published_revision"] != record["revision"]
+                    or current["published_at"] != record["published_at"]):
                 return None
+            record["generation"] = current["generation"]
         return record
+
+    def published_count(self) -> int:
+        """Count current public assets without reading drafts, bodies or chunks."""
+        with self._connection() as connection:
+            if connection is None:
+                return 0
+            row = connection.execute(
+                "SELECT COUNT(*) AS total FROM knowledge_assets WHERE published_revision IS NOT NULL"
+            ).fetchone()
+            return int(row["total"])
+
+    def published_catalog(self) -> list[dict]:
+        """Project current public metadata without hydrating OSS or newer drafts."""
+        with self._connection() as connection:
+            if connection is None:
+                return []
+            rows = connection.execute("""SELECT a.knowledge_id, a.published_revision AS revision,
+                a.published_at, r.record_json FROM knowledge_assets a
+                JOIN knowledge_revisions r ON a.knowledge_id = r.knowledge_id
+                AND a.published_revision = r.revision
+                ORDER BY a.published_at DESC, a.knowledge_id""")
+            result = []
+            for row in rows:
+                record = json.loads(row["record_json"])
+                evidence = record.get("evidence", {})
+                related = evidence.get("related_assets", [])
+                result.append({
+                    "knowledge_id": row["knowledge_id"], "revision": row["revision"],
+                    "published_at": row["published_at"], "title": record["title"],
+                    "kind": record.get("kind", "未知"), "source_type": evidence.get("source_type"),
+                    "scenarios": record.get("scenarios", []),
+                    # Uploads currently carry an authenticated principal, but no
+                    # employee-position snapshot. Department/audience are not it.
+                    "uploader_position": None,
+                    "related_knowledge_ids": sorted({item["knowledge_id"] for item in related
+                        if isinstance(item, dict) and isinstance(item.get("knowledge_id"), str)})
+                        if isinstance(related, list) else [],
+                })
+            public_ids = {item["knowledge_id"] for item in result}
+            for item in result:
+                item["related_knowledge_ids"] = [key for key in item["related_knowledge_ids"]
+                    if key in public_ids and key != item["knowledge_id"]]
+            return result
+
+    def graph_internal_snapshot(self) -> list[dict]:
+        """Private projection for derived graph features, never an HTTP payload."""
+        with self._connection() as connection:
+            if connection is None:
+                return []
+            rows = connection.execute("""SELECT a.knowledge_id, a.published_revision AS revision,
+                a.published_at, r.record_json FROM knowledge_assets a
+                JOIN knowledge_revisions r ON a.knowledge_id=r.knowledge_id
+                AND a.published_revision=r.revision ORDER BY a.published_at DESC,a.knowledge_id""")
+            result = []
+            for row in rows:
+                record = json.loads(row["record_json"])
+                evidence = record.get("evidence", {})
+                related = evidence.get("related_assets", [])
+                result.append({
+                    "knowledge_id": row["knowledge_id"], "revision": row["revision"],
+                    "published_at": row["published_at"], "content_hash": record["content_hash"],
+                    "title": record["title"], "kind": record.get("kind", "未知"),
+                    "source_type": evidence.get("source_type"), "uploader_position": None,
+                    "source_namespace": evidence.get("governance_receipt_id"),
+                    "source_aliases": [{"name": source.get("name", ""), "locator": source.get("locator", "")}
+                                       for source in record.get("sources", [])],
+                    "recorded_related_ids": sorted({item["knowledge_id"] for item in related
+                        if isinstance(item, dict) and isinstance(item.get("knowledge_id"), str)})
+                        if isinstance(related, list) else [],
+                })
+            return result
 
     def list_assets(self) -> list[dict]:
         with self._connection() as connection:

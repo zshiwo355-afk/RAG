@@ -2,9 +2,11 @@
 
 这是一个面向白酒产品资料的后端 RAG 项目，支持文本检索、图片语义检索、图片本体检索、多路召回、Rerank-only 精排、OSS 图片 URL 返回，以及基于产品上下文的销售助手回答。
 
-公司知识正式入库使用独立的 `company_knowledge_hybrid` 检索表和 `/api/knowledge/*` 只读接口，支持 PostgreSQL 版本目录、私有 OSS 完整正文、ZIP/CSV 批次采集、草稿导入、发布与撤回。检索命中片段后默认返回同版本完整资产，支持部门/场景筛选；读取访问边界由部署网关控制，维护操作仅通过 CLI。本地 SQLite 模式保留兼容，白酒接口和数据表保持原样。配置与操作步骤见 [公司知识指南](docs/COMPANY_KNOWLEDGE.md)。
+公司知识正式入库使用独立的 `company_knowledge_hybrid` 检索表和 `/api/knowledge/*` 只读接口，支持 PostgreSQL 版本目录、私有 OSS 完整正文、ZIP/CSV 批次采集、草稿导入、发布与撤回。检索命中片段后默认返回同版本完整资产，支持部门/场景筛选；读取接口不要求 API Key，只返回已发布资料，不生成回答，维护操作仅通过 CLI。本地 SQLite 模式保留兼容，白酒接口和数据表保持原样。配置与操作步骤见 [公司知识指南](docs/COMPANY_KNOWLEDGE.md)。
 
 公司知识现支持文本向量＋关键词召回、资产级 RRF 融合和 `gte-rerank-v2` 重排，不接入图片召回；重排不可用时明确返回 RRF 回退状态。全文索引使用独立分词字段，保留原文及哈希。正式批次已使用新表 `company_knowledge_hybrid`，旧纯向量表不重建；既有资料迁移需保留版本目录及 OSS 引用，不能只切换表名或重新导入，步骤见公司知识指南。
+
+公司知识自动沉淀现支持私有 OSS 原件收件、持久处理队列、清洗与精确查重、版本保护、按规则自动发布，以及目录、岗位/类型统计和 Wiki 知识图谱。知识工作台提供 Markdown/TXT、Word、PDF 和资产 ZIP 手动上传，展示收件、处理与异常状态；员工端提供仅采集启用后新增内容的采集脚本。功能分别由独立开关及现有角色权限控制，代码提交不代表生产部署或全员验收。详见[收件](docs/KNOWLEDGE_RECEIPTS.md)、[处理与发布](docs/KNOWLEDGE_PROCESSING.md)、[员工端采集](docs/KNOWLEDGE_COLLECTOR.md)和[知识工作台](web/visual-ingest/KNOWLEDGE_PORTAL.md)。
 
 ## 当前能力
 

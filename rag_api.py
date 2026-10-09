@@ -52,8 +52,12 @@ if visual_ingest_router is not None and hasattr(app, "include_router"):
 
 if hasattr(app, "include_router"):
     from rag_app.knowledge_api import router as knowledge_router
+    from rag_app.knowledge_receipts_api import router as knowledge_receipts_router
+    from rag_app.knowledge_processing_api import router as knowledge_processing_router
 
     app.include_router(knowledge_router)
+    app.include_router(knowledge_receipts_router)
+    app.include_router(knowledge_processing_router)
 
 REQUIRED_ENV = (
     "DASHSCOPE_API_KEY",

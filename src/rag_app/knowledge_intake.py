@@ -25,6 +25,9 @@ from .knowledge_text import clean_text, credential_name, parse_text_file
 INTAKE_VERSION = "intake-v2"
 SOURCE_PROTOCOL = "company-assets-source-v2"
 SOURCE_COLUMNS = ("资产编号", "名称", "类型", "状态", "用途", "正文路径", "来源定位", "证据状态", "限制与待办", "合并目标")
+SOURCE_GOVERNANCE_COLUMNS = {"基线修订": "source_base_revision", "共享范围": "source_sharing",
+                             "使用对象": "source_audience", "输入": "source_inputs", "输出": "source_outputs",
+                             "依赖与权限": "source_dependencies", "适用边界": "source_boundaries"}
 SOURCE_TYPES = {"方法": "method", "流程": "process", "模板": "template", "提示词": "prompt",
                 "Skill方法": "method", "案例": "case", "规则": "policy", "参考": "reference"}
 MAX_ARCHIVE = 512 * 1024 * 1024
@@ -123,9 +126,14 @@ def _references(text):
             narrative.append(line)
     text = "".join(narrative)
     code_spans = re.compile(r"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)", re.S)
-    values = re.findall(r"\[[^\]\n]*\]\(((?:[^()\n]|\([^()\n]*\))+)\)", code_spans.sub(" ", text))
+    links = re.findall(r"\[([^\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)", code_spans.sub(" ", text))
+    # Redacted names followed by parenthetical job/data notes are not files.
+    values = [value for label, value in links
+              if not (re.fullmatch(r"(?:姓名|编号|ID|长编号|机器人ID)略", label)
+                      and not re.search(r"[/\\]|\.[A-Za-z][A-Za-z0-9]{0,7}(?:#.*)?$", value))]
     values += [match[2].strip() for match in code_spans.finditer(text)
-               if re.fullmatch(r"(?:\.\./)*(?:references|templates|assets|scripts|tools|附件)/[^\n]+", match[2].strip())]
+               if re.fullmatch(r"(?:\.\./)*(?:references|templates|assets|scripts|tools|附件)/[^\n]+", match[2].strip())
+               and match[2].strip() not in {"tools/list", "tools/call"}]
     return sorted(set(value.strip(" <>") for value in values if value.strip()))
 
 
@@ -212,9 +220,13 @@ def scan_package(source, cache):
                             if _incomplete(parsed["issues"]):
                                 raise ValueError("source_manifest_invalid")
                             rows = list(csv.reader(io.StringIO(data.decode("utf-8-sig"), newline=""), strict=True))
-                            if not rows or tuple(rows[0]) != SOURCE_COLUMNS or any(len(row) != len(SOURCE_COLUMNS) for row in rows[1:]):
+                            columns = tuple(rows[0]) if rows else ()
+                            if (columns[:len(SOURCE_COLUMNS)] != SOURCE_COLUMNS
+                                    or len(columns) != len(set(columns))
+                                    or not set(columns[len(SOURCE_COLUMNS):]).issubset(SOURCE_GOVERNANCE_COLUMNS)
+                                    or any(len(row) != len(columns) for row in rows[1:])):
                                 raise ValueError("source_manifest_invalid")
-                            documents[name]["csv_rows"] = [dict(zip(SOURCE_COLUMNS, (clean_text(cell)[0].strip() for cell in row))) for row in rows[1:]]
+                            documents[name]["csv_rows"] = [dict(zip(columns, (clean_text(cell)[0].strip() for cell in row))) for row in rows[1:]]
                         item.update(state="parsed", disposition="supporting_material",
                                     redactions=parsed["redactions"], issues=parsed["issues"],
                                     cleaned_hash=parsed["cleaned_hash"], cache_key=key)
@@ -263,11 +275,14 @@ def _source_manifest(report, documents):
                     or state not in {"交付", "待补", "排除", "合并"}):
                 raise ValueError("source_manifest_invalid_row")
             ids[key.casefold()] = row
+            base = row.get("基线修订", "")
+            if base and not re.fullmatch(r"[1-9][0-9]{0,8}", base):
+                raise ValueError("source_manifest_invalid_base_revision")
             if state == "交付":
                 path = row["正文路径"].replace("\\", "/")
                 if (not path or path.startswith(("/", "~")) or ":" in path or "\x00" in path
                         or any(part in {"", ".", ".."} for part in path.split("/"))
-                        or PurePosixPath(path).suffix.lower() not in {".md", ".txt"}):
+                        or PurePosixPath(path).suffix.lower() not in {".md", ".txt", ".docx", ".pdf"}):
                     raise ValueError("source_manifest_unsafe_path")
                 name = posixpath.join(posixpath.dirname(names[0]), path)
                 if name.casefold() in paths:
@@ -447,14 +462,21 @@ def _prepare_assets(source, report, documents):
         seeds = [name for name in documents if PurePosixPath(name).suffix.lower() in {".md", ".txt", ".docx", ".xlsx", ".pdf"}
                  and PurePosixPath(name).name not in {"交付说明.md", "README.md"}]
     primary_count = len(seeds)
-    owned, collections = {}, {}
+    owned, collections, attachment_roots = {}, {}, {}
 
     def asset_identity(path):
         identity = "source-v2/" + delivered[path]["资产编号"] if delivered is not None else _relative(path)
         return "ka_" + sha(source["source_id"] + "/" + identity)[:24]
 
     for name in seeds:
-        if delivered is not None or PurePosixPath(name).name.lower() != "skill.md":
+        if delivered is not None:
+            # Source-v2 assigns its attachment directory by the CSV asset ID,
+            # even when the body lists files as plain text instead of links.
+            root = posixpath.join(posixpath.dirname(manifest[0]), "附件", delivered[name]["资产编号"]) + "/"
+            attachment_roots[name] = root
+            owned[name] = [key for key in sorted(documents) if key.startswith(root)]
+            continue
+        if PurePosixPath(name).name.lower() != "skill.md":
             continue
         root = posixpath.dirname(name) + "/"
         owned[name] = [key for key in sorted(documents) if key.startswith(root)
@@ -473,6 +495,12 @@ def _prepare_assets(source, report, documents):
             continue
         members, issues, related = [name], list(doc["issues"]), set(collections.get(name, ()))
         available = {file["name"] for file in report["files"]}
+        attachment_root = attachment_roots.get(name)
+        if attachment_root:
+            for file in report["files"]:
+                if file["name"].startswith(attachment_root) and file["name"] not in documents:
+                    code = "script_dependency_not_provided" if PurePosixPath(file["name"]).suffix.lower() in SCRIPT_EXTENSIONS else "referenced_material_unparsed"
+                    issues.append({"code": code, "reference": file["name"]})
         # A real Skill directory owns its textual references/templates. Sibling
         # flattened Skills are separate assets, never all bundled by KA number.
         members += [key for key in owned.get(name, ()) if key not in collections]
@@ -495,6 +523,10 @@ def _prepare_assets(source, report, documents):
                     # Directory mentions are not claims about any one missing file.
                     continue
                 resolved = _resolve_reference(member, reference, available)
+                if resolved is None and attachment_root:
+                    candidate = posixpath.normpath(posixpath.join(attachment_root, unquote(reference).replace("\\", "/")))
+                    if candidate.startswith(attachment_root) and candidate in available:
+                        resolved = candidate
                 if (delivered is not None and resolved and "知识正文" in PurePosixPath(resolved).parts
                         and resolved not in delivered):
                     issues.append({"code": "unresolved_reference", "reference": reference})
@@ -540,8 +572,11 @@ def _prepare_assets(source, report, documents):
                                         "locator": "资产 " + row["资产编号"] + "；" + _public_locator(row["来源定位"])})
             metadata["evidence"].update(source_protocol=SOURCE_PROTOCOL, source_asset_id=row["资产编号"],
                                         source_type=row["类型"], source_disposition=row["状态"],
+                                        source_locator=_public_locator(row["来源定位"]),
                                         source_purpose=row["用途"], source_evidence_status=row["证据状态"],
                                         source_limitations=row["限制与待办"], source_approval=False)
+            metadata["evidence"].update({field: row[column] for column, field in SOURCE_GOVERNANCE_COLUMNS.items()
+                                         if row.get(column)})
             if row["类型"] == "Skill方法":
                 metadata["evidence"]["delivery_scope"] = "method_reference_only"
         asset = {"knowledge_id": asset_id, "metadata": metadata, "content": body,
