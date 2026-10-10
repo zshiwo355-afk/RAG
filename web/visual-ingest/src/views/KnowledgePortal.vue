@@ -3,16 +3,11 @@
     <a class="skip-link" href="#knowledge-main">跳到主要内容</a>
 
     <main v-if="!session" id="knowledge-main" class="portal-entry">
-      <section class="entry-story" aria-labelledby="entry-title">
-        <div class="wordmark"><span class="archive-mark" aria-hidden="true">知</span><span>公司知识中心<small>KNOWLEDGE ARCHIVE</small></span></div>
-        <div class="entry-copy"><span class="eyebrow">每一份经验，都有来处。</span><h1 id="entry-title">让经验留得下，<br>也找得到。</h1><p>把日常工作里的方法、案例与实践，<br>变成团队可以继续使用的知识。</p></div>
-        <div class="entry-index"><span>01　保留来源</span><span>02　整理经验</span><span>03　持续复用</span></div>
-      </section>
       <section class="entry-form" aria-labelledby="login-title">
         <div v-if="checkingSession" class="entry-check" role="status"><span class="loading-dot" />正在确认登录状态…</div>
         <template v-else>
-          <span class="eyebrow">个人工作入口</span><h2 id="login-title">进入知识中心</h2>
-          <p class="intro">查看沉淀进度、阅读处理结果。使用你的个人 MCP 连接凭据登录。</p>
+          <h1 id="login-title">公司知识库</h1>
+          <p class="intro">使用个人 MCP 凭据登录，查看知识和上传记录。</p>
           <div v-if="loginError" class="message error" role="alert">{{ loginError }}</div>
           <form @submit.prevent="login">
             <label for="knowledge-credential">个人 MCP 凭据</label>
@@ -22,26 +17,24 @@
           </form>
           <button v-if="logoutUnconfirmed" class="button subtle" :disabled="signingOut" @click="logout">重试退出登录</button>
           <button v-else-if="initialCheckFailed" class="button subtle" @click="checkSession">重新检查连接</button>
-          <div class="entry-note"><span aria-hidden="true">↗</span><p><strong>自动采集与手动上传都可沉淀</strong><br>Agent 按设定时间运行；也可以登录后提交资料、查看知识与处理结果。</p></div>
+
         </template>
       </section>
     </main>
 
     <div v-else class="portal-shell" :class="{ 'graph-mode': activeView === 'graph' }">
       <aside class="portal-sidebar" aria-label="知识中心导航">
-        <a class="wordmark" href="/rag/knowledge"><span class="archive-mark" aria-hidden="true">知</span><span>公司知识中心<small>KNOWLEDGE ARCHIVE</small></span></a>
-        <div class="sidebar-section">工作空间</div>
-        <nav class="knowledge-navigation"><a v-for="entry in views" :key="entry.key" :href="`#${entry.key}`" class="sidebar-nav" :class="{ 'sidebar-active': activeView === entry.key }" :aria-current="activeView === entry.key ? 'page' : undefined" :title="entry.label"><span aria-hidden="true">{{ entry.icon }}</span><span class="navigation-label">{{ entry.label }}</span><span v-if="activeView === entry.key" class="nav-dot" /></a></nav>
-        <div class="sidebar-note"><span class="eyebrow">经验留在团队里</span><p>按岗位找到沉淀，<br>按类型复用方法，<br>沿着关系发现知识。</p><p>新的资料通过清洗与发布检查后，会自动出现在这里。</p></div>
-        <div class="sidebar-footer"><span class="tiny-dot" />原件保留，过程可追溯</div>
+        <a class="wordmark" href="/rag/knowledge">公司知识库</a>
+        <nav class="knowledge-navigation"><a v-for="entry in views" :key="entry.key" :href="`#${entry.key}`" class="sidebar-nav" :class="{ 'sidebar-active': activeView === entry.key }" :aria-current="activeView === entry.key ? 'page' : undefined">{{ entry.label }}</a></nav>
+
       </aside>
 
       <div class="portal-workspace">
-        <header class="portal-topbar"><span>公司数字资产 <span class="breadcrumb-divider">/</span> {{ viewTitle }}</span><div class="identity"><span class="avatar" aria-hidden="true">{{ session.principal.display_name.slice(0, 1) || '我' }}</span><span>{{ session.principal.display_name || '当前用户' }}</span><button class="text-button" :disabled="signingOut" @click="logout">{{ signingOut ? '退出中…' : '退出' }}</button></div></header>
+        <header class="portal-topbar"><span>知识库 <span class="breadcrumb-divider">/</span> {{ viewTitle }}</span><div class="identity"><span>{{ session.principal.display_name || '当前用户' }}</span><button class="text-button" :disabled="signingOut" @click="logout">{{ signingOut ? '退出中…' : '退出' }}</button></div></header>
         <KnowledgeDashboard v-if="activeView === 'overview' || activeView === 'graph'" :view="activeView" :session="session" :overview="overview" :overview-error="overviewError" :refresh-key="refreshKey" :refreshing="overviewLoading" @refresh="refresh" @error="handleError" @processing="showProcessing" />
         <KnowledgeUpload v-else-if="activeView === 'upload'" :session="session" @submitted="refresh" @error="handleError" @processing="showProcessing()" />
         <main v-else id="knowledge-main" class="portal-main" tabindex="-1">
-          <section class="page-heading"><div><span class="eyebrow">KNOWLEDGE INTAKE</span><h1>上传与异常</h1><p>跟进收件、清洗和发布。每 30 秒更新，异常保留原因和处理入口。</p></div><div class="heading-controls"><label v-if="canCompanyOverview" class="scope-control">统计范围<select v-model="scope"><option value="self">我的收件</option><option value="company">公司汇总</option></select></label><button class="button refresh-button" :disabled="overviewLoading || jobsLoading" @click="refresh">{{ overviewLoading || jobsLoading ? '更新中…' : '刷新数据' }}<span aria-hidden="true">↻</span></button></div></section>
+          <section class="page-heading"><div><h1>上传与异常</h1><p>查看原件核验、处理结果和待补充事项。</p></div><div class="heading-controls"><label v-if="canCompanyOverview" class="scope-control">统计范围<select v-model="scope"><option value="self">我的收件</option><option value="company">公司汇总</option></select></label><button class="button refresh-button" :disabled="overviewLoading || jobsLoading" @click="refresh">{{ overviewLoading || jobsLoading ? '更新中…' : '刷新数据' }}<span aria-hidden="true">↻</span></button></div></section>
 
           <section class="overview-section" aria-label="沉淀概览" :aria-busy="overviewLoading">
             <div class="section-caption"><span>{{ scope === 'company' ? '公司处理概览' : '我的处理概览' }}</span><span>{{ overview ? `更新于 ${formatDate(overview.generated_at)}` : '实时服务数据' }}</span></div>
@@ -64,7 +57,7 @@
             <div v-if="jobs.length" class="table-wrap" :aria-busy="jobsLoading" tabindex="0" aria-label="处理任务列表"><table class="jobs-table"><thead><tr><th scope="col">收件资料</th><th scope="col">处理状态</th><th scope="col">逐项去向</th><th scope="col">更新时间</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="job in jobs" :key="job.job_id"><td><button class="job-name" @click="openJob(job.job_id)"><span class="file-symbol" aria-hidden="true">≡</span><span><strong>{{ job.filename || '未命名资料' }}</strong><small>收件 {{ shortId(job.receipt_id) }}</small></span></button></td><td><span class="status-badge" :class="job.status"><span />{{ statusName(job.status) }}</span><small v-if="job.status === 'running'" class="stage-note">{{ stageName(job.stage) }}</small></td><td><div class="item-counts"><span>{{ job.counts.published || 0 }} 发布回执</span><span>{{ job.counts.draft }} 草稿</span><span v-if="job.counts.indexing">{{ job.counts.indexing }} 索引中</span><span :class="{ 'needs-attention': job.counts.needs_review > 0 }">{{ job.counts.needs_review }} 待处理</span><span v-if="job.counts.duplicate">{{ job.counts.duplicate }} 重复</span><span v-if="job.counts.outdated">{{ job.counts.outdated }} 历史版本</span><span>{{ job.counts.archived }} 归档</span></div></td><td class="time-cell">{{ formatDate(job.updated_at) }}</td><td><button class="text-button details-link" :aria-label="`查看 ${job.filename || '资料'} 的处理详情`" @click="openJob(job.job_id)">查看<span aria-hidden="true"> ↗</span></button></td></tr></tbody></table></div>
             <div v-if="jobsTotal !== null && jobsTotal > 0" class="list-footer"><span>共 {{ jobsTotal }} 个处理任务 · 每页 {{ pageSize }} 个</span><el-pagination :current-page="page" :page-size="pageSize" :total="jobsTotal" layout="prev, pager, next" prev-text="上一页" next-text="下一页" :disabled="jobsLoading" @current-change="changePage" /></div>
           </section>
-          <footer class="portal-footnote"><span>原件 ≠ 草稿 ≠ 正式知识</span><p>收件申请与正式知识分别统计。待处理、失败、草稿与索引中的内容不会计入正式知识；重复提交不会增加知识数量。发布回执保留历史结果，正式知识总数按当前发布状态统计。</p></footer>
+          <footer class="portal-footnote"><p>只有正式发布的内容进入知识目录。重复提交不增加知识数量。</p></footer>
         </main>
       </div>
     </div>
@@ -124,10 +117,10 @@ import KnowledgeUpload from '../components/KnowledgeUpload.vue'
 import ReceiptList from '../components/ReceiptList.vue'
 
 type View = 'overview' | 'graph' | 'upload' | 'processing'
-const views: { key: View; label: string; icon: string }[] = [{ key: 'overview', label: '知识总览', icon: '▦' }, { key: 'graph', label: '知识图谱', icon: '⌘' }, { key: 'upload', label: '上传资料', icon: '↑' }, { key: 'processing', label: '上传与异常', icon: '▤' }]
+const views: { key: View; label: string }[] = [{ key: 'overview', label: '知识目录' }, { key: 'graph', label: '知识图谱' }, { key: 'upload', label: '上传资料' }, { key: 'processing', label: '上传与异常' }]
 const readView = (): View => { const value = window.location.hash.slice(1); return value === 'graph' || value === 'processing' || value === 'upload' ? value : 'overview' }
 const activeView = ref<View>(readView())
-const viewTitle = computed(() => views.find(entry => entry.key === activeView.value)?.label || '知识总览')
+const viewTitle = computed(() => views.find(entry => entry.key === activeView.value)?.label || '知识目录')
 const refreshKey = ref(0)
 let refreshTimer: ReturnType<typeof setInterval> | undefined
 function hashChanged() { activeView.value = readView() }

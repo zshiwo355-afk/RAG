@@ -16,6 +16,8 @@ from .knowledge_processing import ProcessingError, ProcessingService, Processing
 from .knowledge_graph import KnowledgeGraph
 from .knowledge_receipts_api import authenticated_principal
 from .knowledge_store import KnowledgeStore
+from .knowledge_api import KnowledgeSearchRequest, search_knowledge
+from .knowledge_service import KnowledgeService
 
 
 READ_SELF = "company_knowledge.submissions.read"
@@ -159,6 +161,15 @@ def _catalog_kind(item):
 def _require_catalog(caller):
     if not caller[1].intersection({READ_KNOWLEDGE, REVIEW}):
         raise HTTPException(status_code=403, detail="processing_permission_required")
+
+
+@router.post("/search")
+def semantic_search(body: KnowledgeSearchRequest, request: Request,
+                    caller=Depends(portal_caller), catalog=Depends(get_catalog)):
+    _require_catalog(caller)
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="invalid_processing_request")
+    return search_knowledge(body, KnowledgeService(store=catalog))
 
 
 @router.get("/graph")

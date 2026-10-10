@@ -36,13 +36,15 @@ assert.equal(unchanged.blob,zip)
 for (const bad of [new File(['x'],'old.doc'),new File(['x'],'../unsafe.md'),new File([],'empty.txt'),new File(['x'],'a'.repeat(201)+'.zip'),new File([new Uint8Array(FILE_LIMIT+1)],'large.pdf')]) await assert.rejects(packageFile(bad,metadata))
 await assert.rejects(packageFile(file,{...metadata,title:''}))
 const receipt={receipt_id:'a'.repeat(32),sha256:first.sha256,byte_length:first.blob.size}
-const result={receipt,upload:{method:'PUT',url:OSS_ORIGIN+'/knowledge-receipts/raw/test/blob?Signature=synthetic',headers:{'Content-Length':String(first.blob.size),'Content-Type':'application/octet-stream','x-oss-object-acl':'private','x-oss-forbid-overwrite':'true','x-oss-meta-sha256':first.sha256,'x-oss-meta-receipt-id':receipt.receipt_id}}}
+const result={receipt,upload:{method:'PUT',url:OSS_ORIGIN+'/knowledge-receipts/raw/'+'0'.repeat(32)+'/'+receipt.receipt_id+'/source?Signature=synthetic',headers:{'Content-Length':String(first.blob.size),'Content-Type':'application/octet-stream','x-oss-object-acl':'private','x-oss-forbid-overwrite':'true','x-oss-meta-sha256':first.sha256,'x-oss-meta-receipt-id':receipt.receipt_id}}}
 let calls=0; const originalFetch=globalThis.fetch
 try {
- globalThis.fetch=async (url,opts)=>{calls++; assert.equal(opts.credentials,'omit');assert.equal(opts.redirect,'error');assert.equal(opts.referrerPolicy,'no-referrer');assert.equal(opts.headers['content-length'],undefined);assert.equal(opts.body,first.blob);return {ok:true}}
+ globalThis.fetch=async (url,opts)=>{calls++; if(calls===2) assert.ok(url.includes('%2F') && url.endsWith('?Signature=synthetic')); assert.equal(opts.credentials,'omit');assert.equal(opts.redirect,'error');assert.equal(opts.referrerPolicy,'no-referrer');assert.equal(opts.headers['content-length'],undefined);assert.equal(opts.body,first.blob);return {ok:true}}
  await putOriginal(first,result,new AbortController().signal)
- for(const url of ['https://example.com/upload',OSS_ORIGIN+'/other/path']) await assert.rejects(putOriginal(first,{...result,upload:{...result.upload,url}},new AbortController().signal))
+ const encoded={...result,upload:{...result.upload,url:result.upload.url.replace('/knowledge-receipts/raw/','/knowledge-receipts%2Fraw%2F').replace('/'+receipt.receipt_id+'/source','%2F'+receipt.receipt_id+'%2Fsource')}}
+ await putOriginal(first,encoded,new AbortController().signal)
+ for(const url of ['https://example.com/upload',OSS_ORIGIN+'/other/path',result.upload.url.replace(receipt.receipt_id,'b'.repeat(32)),result.upload.url.replace('/knowledge-receipts/raw/','/knowledge-receipts%252Fraw%252F'),result.upload.url.replace('/source?','/%2e%2e/source?')]) await assert.rejects(putOriginal(first,{...result,upload:{...result.upload,url}},new AbortController().signal))
  await assert.rejects(putOriginal(first,{...result,upload:{...result.upload,headers:{...result.upload.headers,'x-oss-object-acl':'public-read'}}},new AbortController().signal))
- assert.equal(calls,1)
+ assert.equal(calls,2)
 } finally {globalThis.fetch=originalFetch}
 console.log('Upload package checks passed: deterministic ZIP, original bytes, Python CRC/CSV, limits, private same-bucket PUT.')

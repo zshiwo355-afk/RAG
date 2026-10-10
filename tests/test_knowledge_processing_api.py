@@ -92,6 +92,33 @@ def headers(*permissions, principal="alice"):
 BASE = "/api/rag/knowledge-processing"
 
 
+def test_portal_semantic_search_reuses_published_search_and_checks_permissions(api, monkeypatch):
+    from rag_app.knowledge_service import KnowledgeService
+    client, _, _ = api
+    calls = []
+    def search(self, query, top_k, **options):
+        calls.append((query, top_k, options))
+        return [{'knowledge_id': 'published', 'revision': 1, 'title': '入库核对', 'snippet': '检查发布后的全文。'}]
+    monkeypatch.setattr(KnowledgeService, 'search', search)
+    body = {'query': '如何确认同事能查到资料', 'top_k': 10, 'include_content': False}
+    assert client.post(BASE + '/search', json=body).status_code == 401
+    for permission in (SELF, DASH):
+        assert client.post(BASE + '/search', headers=headers(permission), json=body).status_code == 403
+    assert not calls
+    result = client.post(BASE + '/search', headers=headers(READ), json=body)
+    assert result.status_code == 200
+    assert result.json()['results'][0]['knowledge_id'] == 'published'
+    assert calls == [(body['query'], 10, {'include_content': False, 'department': None, 'scenario': None})]
+    assert result.headers['cache-control'] == 'no-store'
+    assert client.post(BASE + '/search?scope=self', headers=headers(READ), json=body).status_code == 422
+    assert client.post(BASE + '/search', headers=headers(READ), json={**body, 'table': 'other'}).status_code == 422
+    def unavailable(*args, **kwargs):
+        raise RuntimeError('private credential')
+    monkeypatch.setattr(KnowledgeService, 'search', unavailable)
+    result = client.post(BASE + '/search', headers=headers(READ), json=body)
+    assert result.status_code == 503 and 'private credential' not in result.text
+
+
 def test_resolve_requires_review_and_uses_trusted_actor_with_version_guard(api):
     client, jobs, _ = api
     path = BASE + f'/jobs/{JOB}/items/{ITEM}/resolve'

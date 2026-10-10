@@ -1,17 +1,17 @@
 <template>
   <main id="knowledge-main" class="portal-main knowledge-upload" tabindex="-1">
-    <header class="upload-heading"><div><span class="eyebrow">ADD TO THE SHARED LIBRARY</span><h1>把经验，交给下一位同事。</h1><p>上传原件，补充用途；系统负责核验、清洗、查重和处理。</p></div><button type="button" class="upload-link" @click="emit('processing')">查看上传与异常 ↗</button></header>
+    <header class="upload-heading"><div><h1>上传资料</h1><p>选择文件，填写用途后提交。可查看核验和处理结果。</p></div><button type="button" class="upload-link" @click="emit('processing')">上传记录</button></header>
     <section v-if="!canUpload" class="upload-unavailable"><h2>当前账号未开放上传</h2><p>管理员可在 MCP 角色中配置知识提交权限。无需另建上传账号。</p></section>
     <div v-else class="upload-layout">
       <form class="upload-form" @submit.prevent="submit">
-        <section class="upload-panel"><div class="upload-section-title"><span>01</span><h2>选择一份资料</h2></div>
+        <section class="upload-panel"><div class="upload-section-title"><h2>文件</h2></div>
           <div class="upload-drop" :class="{ dragging: dragOver, selected: file, locked }" @dragover.prevent="!locked && (dragOver = true)" @dragleave.prevent="dragOver = false" @drop.prevent="dropFile">
             <span class="upload-file-mark" aria-hidden="true">{{ file ? '▤' : '↥' }}</span><strong>{{ file?.name || '拖入资料，或选择文件' }}</strong><p>{{ file ? `${formatBytes(file.size)} · ${isZip ? '现有资产资料包' : '保留原始文件'}` : 'Markdown、TXT、Word（.docx）、PDF 或现有资产 ZIP' }}</p>
             <label class="upload-pick" :class="{ disabled: locked }">{{ file ? '更换文件' : '选择文件' }}<input ref="fileInput" type="file" accept=".md,.txt,.docx,.pdf,.zip" :disabled="locked" aria-label="选择知识资料文件" @change="pickFile"></label><small>一次上传一份。原件最多 {{ formatBytes(originalLimit) }}，资产 ZIP 最多 {{ formatBytes(packageLimit) }}。</small>
           </div>
           <p v-if="isZip" class="upload-hint">ZIP 应为已有资产资料包，包含交付清单和正文。系统按包内清单处理，普通文件压缩包可能需要补充信息。</p>
         </section>
-        <fieldset v-if="file && !isZip" class="upload-panel upload-metadata" :disabled="locked"><legend class="sr-only">知识说明</legend><div class="upload-section-title"><span>02</span><h2>让同事知道怎么用</h2></div>
+        <fieldset v-if="file && !isZip" class="upload-panel upload-metadata" :disabled="locked"><legend class="sr-only">知识说明</legend><div class="upload-section-title"><h2>资料说明</h2></div>
           <div class="upload-fields"><label>知识名称 <span>必填</span><input v-model="metadata.title" maxlength="240" required placeholder="例如：新员工客户交接流程"></label><label>知识类型 <span>必填</span><select v-model="metadata.kind" required><option value="" disabled>请选择类型</option><option v-for="entry in kinds" :key="entry.value" :value="entry.value">{{ entry.label }}</option></select></label></div>
           <label class="upload-field">用途 <span>必填</span><textarea v-model="metadata.purpose" maxlength="2000" rows="2" required placeholder="这份资料帮助同事完成什么，适合在什么情况下使用？" /></label>
           <details class="upload-reuse"><summary>补充使用信息 <span>{{ missingFields.length ? `还有 ${missingFields.length} 项待补充` : '已填写完整' }}</span></summary><p>以下信息用于判断能否直接复用。未填写的内容会进入待补充，不会被当成已经通过发布检查。</p>
@@ -23,14 +23,14 @@
           </details>
           <p v-if="missingFields.length" class="upload-review-note">待补充：{{ missingFields.join('、') }}。你仍可提交，后台会记录缺项并进入待处理。</p>
         </fieldset>
-        <section class="upload-panel upload-confirm"><label class="sharing-confirm"><input v-model="sharingConfirmed" type="checkbox" :disabled="locked"><span>我确认这份资料允许公司全员查看，且没有不应共享的个人信息、密码或密钥。</span></label><p>原文保存在私有 OSS。只有通过处理并正式发布的知识，才会进入全员可查的目录与图谱。</p>
+        <section class="upload-panel upload-confirm"><label class="sharing-confirm"><input v-model="sharingConfirmed" type="checkbox" :disabled="locked"><span>我确认这份资料允许公司全员查看，且没有不应共享的个人信息、密码或密钥。</span></label><p>原件仅本人和获授权人员可查看。正式发布后，知识对公司全员可见。</p>
           <div v-if="error" class="upload-error" role="alert">{{ error }}</div>
           <div class="upload-actions"><button v-if="!frozenPackage" type="submit" class="upload-primary" :disabled="running || !canSubmit">{{ running ? '正在提交…' : '提交资料' }}<span aria-hidden="true">↗</span></button><button v-else-if="!running && !jobFinished && receipt?.status !== 'rejected'" type="button" class="upload-primary" :disabled="!sharingConfirmed" @click="submit">{{ receipt?.content_verified ? '继续查询处理结果' : receipt?.status === 'failed' ? '再次核验原件' : '继续 / 重试本次提交' }}</button><button v-if="running" type="button" class="upload-secondary" @click="cancel">停止本页操作</button><button v-if="file && !running && frozenPackage" type="button" class="upload-secondary" @click="resetUpload">上传另一份 / 重新填写</button></div>
-          <small v-if="frozenPackage">本次资料与说明已冻结；可重试的收件沿用同一回执。资料或说明改变后才形成新的提交，原样提交仍返回原记录。</small>
+          <small v-if="frozenPackage">重试沿用本次收件记录。如需修改文件或说明，请重新填写。</small>
         </section>
       </form>
       <aside class="upload-progress" aria-label="本次提交进度" aria-live="polite">
-        <span class="eyebrow">SUBMISSION STATUS</span><h2>{{ stageTitle }}</h2><p class="upload-status-note">{{ note || '选择文件并确认共享范围后开始。' }}</p>
+        <h2>{{ stageTitle }}</h2><p class="upload-status-note">{{ note || '选择文件并确认共享范围后开始。' }}</p>
         <ol class="upload-steps"><li v-for="(step, index) in steps" :key="step.title" :class="{ complete: stepIndex > index, current: stepIndex === index && running }"><span>{{ stepIndex > index ? '✓' : String(index + 1).padStart(2, '0') }}</span><div><strong>{{ step.title }}</strong><p>{{ step.description }}</p></div></li></ol>
         <dl v-if="receipt" class="upload-receipt"><div><dt>收件编号</dt><dd>{{ receipt.receipt_id }}</dd></div><div><dt>原件核验</dt><dd>{{ receipt.content_verified ? '已通过；不代表正式发布' : receiptLabel }}</dd></div><div v-if="receipt.error_code"><dt>核验原因</dt><dd>{{ receiptErrorMessage(receipt.error_code) }}</dd></div><div v-if="receipt.status === 'rejected'"><dt>下一步</dt><dd>此回执已结束，尚未进入内容处理。请核对并修正资料后提交；原样提交不会重试此回执。如原件无误，请凭收件编号联系维护人员。</dd></div></dl>
         <div v-if="job" class="upload-result"><h3>{{ job.status === 'failed' ? '后台处理失败' : job.status === 'needs_review' ? '需要补充或核对资料' : jobFinished ? '本次处理已结束' : '后台正在处理' }}</h3><div class="upload-counts"><span><strong>{{ job.counts.published || 0 }}</strong>发布回执</span><span><strong>{{ job.counts.duplicate || 0 }}</strong>重复内容</span><span><strong>{{ job.counts.draft || 0 }}</strong>草稿</span><span><strong>{{ job.counts.needs_review || 0 }}</strong>待处理</span></div><p v-if="job.counts.indexing">另有 {{ job.counts.indexing }} 项正在建立索引。</p><p v-if="job.counts.archived || job.counts.outdated">{{ job.counts.archived || 0 }} 项归档 · {{ job.counts.outdated || 0 }} 项历史版本</p><ul v-if="reasons.length" class="upload-reasons"><li v-for="reason in reasons" :key="reason">{{ reason }}</li></ul><p class="upload-result-boundary">发布回执是本次处理记录，正式知识是否可用以知识库当前状态为准。</p></div>
@@ -73,9 +73,9 @@ const missingFields = computed(() => ([['audience', '使用对象'], ['inputs', 
 const receiptLabel = computed(() => receiptStatusLabels[receipt.value?.status as ReceiptStatus] || '尚未通过')
 const jobFinished = computed(() => !!job.value && ['completed', 'needs_review', 'failed'].includes(job.value.status))
 const kinds = [{ value: '流程', label: 'SOP / 流程' }, { value: 'Skill方法', label: 'Skill' }, { value: '案例', label: '案例' }, { value: '方法', label: '方法' }, { value: '模板', label: '模板' }, { value: '提示词', label: '提示词' }, { value: '规则', label: '规则' }, { value: '参考', label: '参考资料' }]
-const steps = [{ title: '准备提交', description: '保留原文，整理你填写的说明' }, { title: '上传原件', description: '直接上传到私有 OSS' }, { title: '收件核验', description: '核对完整性与文件指纹' }, { title: '后台处理', description: '清洗、查重、发布或记录异常' }]
+const steps = [{ title: '准备提交', description: '保留原文，整理你填写的说明' }, { title: '上传原件', description: '保存原始文件' }, { title: '收件核验', description: '核对完整性与文件指纹' }, { title: '后台处理', description: '清洗、查重、发布或记录异常' }]
 const stepIndex = computed(() => ({ idle: -1, packaging: 0, preparing: 0, uploading: 1, verifying: 2, processing: 3, done: 4 }[stage.value] ?? (job.value ? 3 : receipt.value?.content_verified ? 3 : receipt.value ? 2 : -1)))
-const stageTitle = computed(() => ({ idle: '资料准备好了吗？', packaging: '正在准备资料', preparing: '正在申请上传', uploading: '原件正在上传', verifying: '正在核验收件', processing: '等待后台处理结果', done: job.value?.status === 'failed' ? '资料已收到，处理失败' : job.value?.status === 'needs_review' ? '资料已收到，需要补充' : '本次处理已完成', pending: '后台仍在继续处理', cancelled: '本页操作已停止', error: '本次操作未完成' }[stage.value] || '提交进度'))
+const stageTitle = computed(() => ({ idle: '提交进度', packaging: '正在准备资料', preparing: '正在申请上传', uploading: '原件正在上传', verifying: '正在核验收件', processing: '等待后台处理结果', done: job.value?.status === 'failed' ? '资料已收到，处理失败' : job.value?.status === 'needs_review' ? '资料已收到，需要补充' : '本次处理已完成', pending: '后台仍在继续处理', cancelled: '本页操作已停止', error: '本次操作未完成' }[stage.value] || '提交进度'))
 const reasons = computed(() => [...new Set([...(job.value?.error_code ? [job.value.error_code] : []), ...(job.value?.items || []).flatMap(item => item.reason_codes)])].slice(0, 5).map(code => reasonLabels[code] || `需要进一步核对（${code}）`))
 const formatBytes = (value: number) => value >= 1024 * 1024 ? `${Math.round(value / 1024 / 1024 * 10) / 10} MiB` : value >= 1024 ? `${Math.round(value / 1024 * 10) / 10} KiB` : `${value} B`
 
@@ -181,77 +181,80 @@ onBeforeUnmount(clearSensitive)
 </script>
 
 <style scoped>
-.knowledge-upload { color: #29483a; }
+.knowledge-upload { color: #202122; }
 .upload-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 28px; }
-.upload-heading h1 { margin: 12px 0; font: 500 30px/1.45 'Songti SC', 'Noto Serif CJK SC', serif; }
-.upload-heading p { margin: 0; color: #7a856f; font-size: 12px; line-height: 1.8; }
-.upload-link, .upload-fill { border: 0; background: none; color: #56734e; font: inherit; font-size: 11px; cursor: pointer; text-align: left; }
+.upload-heading h1 { margin: 0 0 7px; font-size: 27px; font-weight: 600; line-height: 1.4; }
+.upload-heading p { margin: 0; color: #54595d; font-size: 12px; line-height: 1.8; }
+.upload-link, .upload-fill { border: 0; background: none; color: #54595d; font: inherit; font-size: 13px; cursor: pointer; text-align: left; }
 .upload-layout { display: grid; grid-template-columns: minmax(0, 1fr) 295px; gap: 23px; align-items: start; }
 .upload-form { min-width: 0; }
-.upload-panel { min-width: 0; margin: 0 0 16px; border: 1px solid #dde4d3; border-radius: 8px; padding: 23px; background: #fcfdf9; }
+.upload-panel { min-width: 0; margin: 0 0 24px; padding: 0 0 24px; border: 0; border-bottom: 1px solid #eaecf0; border-radius: 0; background: #fff; }
 .upload-section-title { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
-.upload-section-title > span { color: #9dab8d; font-size: 11px; }
+.upload-section-title > span { color: #72777d; font-size: 13px; }
 .upload-section-title h2 { margin: 0; font-size: 15px; font-weight: 500; }
-.upload-drop { display: flex; flex-direction: column; align-items: center; border: 1px dashed #c2cfb3; border-radius: 6px; background: #f6f8ef; padding: 22px 16px; text-align: center; }
-.upload-drop.dragging { background: #e9f0df; border-color: #5d8154; }
-.upload-file-mark { font: 32px/1.2 Georgia, serif; color: #839b6c; margin-bottom: 10px; }
-.upload-drop strong { max-width: 100%; overflow-wrap: anywhere; font-size: 13px; font-weight: 500; }
-.upload-drop p { margin: 9px 0 13px; font-size: 11px; color: #849276; line-height: 1.7; }
-.upload-drop small { font-size: 10px; color: #9aa68b; line-height: 1.8; }
-.upload-pick { position: relative; display: inline-flex; align-items: center; min-height: 34px; padding: 0 17px; margin-bottom: 13px; border: 1px solid #c5d2b7; border-radius: 4px; background: #fff; color: #526e45; font-size: 11px; cursor: pointer; }
+.upload-drop { display: flex; flex-direction: column; align-items: center; border: 1px dashed #c8ccd1; border-radius: 2px; background: #f8f9fa; padding: 22px 16px; text-align: center; }
+.upload-drop.dragging { background: #f8f9fa; border-color: #54595d; }
+.upload-file-mark { font: 32px/1.2 Georgia, serif; color: #72777d; margin-bottom: 10px; }
+.upload-drop strong { max-width: 100%; overflow-wrap: anywhere; font-size: 14px; font-weight: 500; }
+.upload-drop p { margin: 9px 0 13px; font-size: 13px; color: #72777d; line-height: 1.7; }
+.upload-drop small { font-size: 12px; color: #72777d; line-height: 1.8; }
+.upload-pick { position: relative; display: inline-flex; align-items: center; min-height: 34px; padding: 0 17px; margin-bottom: 13px; border: 1px solid #c8ccd1; border-radius: 4px; background: #fff; color: #54595d; font-size: 13px; cursor: pointer; }
 .upload-pick input { position: absolute; inset: 0; opacity: 0; width: 100%; cursor: pointer; }
-.upload-pick:focus-within { outline: 2px solid #a77e42; outline-offset: 3px; }
+.upload-pick:focus-within { outline: 2px solid #54595d; outline-offset: 3px; }
 .upload-pick.disabled { opacity: .5; cursor: default; }
-.upload-hint, .upload-review-note { font-size: 11px; line-height: 1.8; margin: 13px 0 0; color: #8d7b51; }
+.upload-hint, .upload-review-note { font-size: 13px; line-height: 1.8; margin: 13px 0 0; color: #54595d; }
 .upload-fields { display: grid; grid-template-columns: minmax(0, 1fr) 160px; gap: 15px; }
-.upload-fields label, .upload-field { display: block; font-size: 11px; color: #647759; }
-.upload-fields label > span, .upload-field > span { margin-left: 5px; color: #a0ad92; font-size: 9px; }
-.upload-metadata input, .upload-metadata select, .upload-metadata textarea { display: block; box-sizing: border-box; width: 100%; max-width: 100%; margin-top: 8px; padding: 9px 10px; border: 1px solid #d5dfca; border-radius: 4px; background: #fff; color: #405839; font: inherit; font-size: 12px; line-height: 1.65; }
+.upload-fields label, .upload-field { display: block; font-size: 13px; color: #54595d; }
+.upload-fields label > span, .upload-field > span { margin-left: 5px; color: #72777d; font-size: 12px; }
+.upload-metadata input, .upload-metadata select, .upload-metadata textarea { display: block; box-sizing: border-box; width: 100%; max-width: 100%; margin-top: 8px; padding: 9px 10px; border: 1px solid #c8ccd1; border-radius: 4px; background: #fff; color: #202122; font: inherit; font-size: 12px; line-height: 1.65; }
 .upload-metadata textarea { resize: vertical; min-height: 62px; }
 .upload-field { margin-top: 17px; }
-.upload-reuse { margin-top: 20px; border-top: 1px solid #e1e7d9; padding-top: 15px; }
-.upload-reuse summary { color: #657b58; font-size: 12px; cursor: pointer; }
-.upload-reuse summary > span { margin-left: 7px; color: #a1ac96; font-size: 10px; }
-.upload-reuse > p { color: #8c987f; font-size: 11px; line-height: 1.8; }
-.upload-fill { padding: 6px 0; font-size: 10px; }
-.sharing-confirm { display: flex; align-items: start; gap: 10px; font-size: 12px; line-height: 1.8; color: #58714c; }
-.sharing-confirm input { margin-top: 4px; accent-color: #466d43; flex-shrink: 0; }
-.upload-confirm > p, .upload-confirm > small { color: #929e84; font-size: 10px; line-height: 1.9; }
+.upload-reuse { margin-top: 20px; border-top: 1px solid #eaecf0; padding-top: 15px; }
+.upload-reuse summary { color: #54595d; font-size: 12px; cursor: pointer; }
+.upload-reuse summary > span { margin-left: 7px; color: #72777d; font-size: 12px; }
+.upload-reuse > p { color: #72777d; font-size: 13px; line-height: 1.8; }
+.upload-fill { padding: 6px 0; font-size: 12px; }
+.sharing-confirm { display: flex; align-items: start; gap: 10px; font-size: 12px; line-height: 1.8; color: #54595d; }
+.sharing-confirm input { margin-top: 4px; accent-color: #54595d; flex-shrink: 0; }
+.upload-confirm > p, .upload-confirm > small { color: #72777d; font-size: 12px; line-height: 1.9; }
 .upload-actions { display: flex; flex-wrap: wrap; gap: 9px; margin: 18px 0 8px; }
-.upload-primary, .upload-secondary { display: inline-flex; align-items: center; justify-content: space-between; gap: 18px; min-height: 37px; padding: 0 16px; border: 1px solid #365c3d; border-radius: 4px; background: #365c3d; color: #fff; font: inherit; font-size: 11px; cursor: pointer; }
-.upload-secondary { background: #fff; border-color: #c8d5ba; color: #6e835e; }
+.upload-primary, .upload-secondary { display: inline-flex; align-items: center; justify-content: space-between; gap: 18px; min-height: 37px; padding: 0 16px; border: 1px solid #36c; border-radius: 3px; background: #36c; color: #fff; font: inherit; font-size: 13px; cursor: pointer; }
+.upload-secondary { background: #fff; border-color: #c8ccd1; color: #54595d; }
 button:disabled, fieldset:disabled input, fieldset:disabled select, fieldset:disabled textarea { opacity: .55; cursor: default; }
-.upload-error { margin: 12px 0; padding: 11px 13px; border: 1px solid #e4cbbb; background: #faf0e8; color: #946848; border-radius: 4px; font-size: 11px; line-height: 1.8; }
-.upload-progress { position: sticky; top: 22px; min-width: 0; padding: 23px; border: 1px solid #dce5cd; border-radius: 8px; background: #eff4e5; }
-.upload-progress h2 { margin: 15px 0 10px; font: 500 21px/1.5 'Songti SC', serif; }
-.upload-status-note { color: #80936e; font-size: 11px; line-height: 1.9; }
+.upload-error { margin: 12px 0; padding: 11px 13px; border: 1px solid #c8ccd1; background: #f8f9fa; color: #54595d; border-radius: 4px; font-size: 13px; line-height: 1.8; }
+.upload-progress { position: sticky; top: 22px; min-width: 0; padding: 0 0 0 24px; border-left: 1px solid #eaecf0; background: #fff; }
+.upload-progress h2 { margin: 0 0 10px; font-size: 16px; font-weight: 600; }
+.upload-status-note { color: #72777d; font-size: 13px; line-height: 1.9; }
 .upload-steps { list-style: none; margin: 25px 0 20px; padding: 0; }
-.upload-steps li { position: relative; display: flex; gap: 12px; padding-bottom: 23px; color: #93a482; }
-.upload-steps li:not(:last-child)::after { content: ''; position: absolute; left: 11px; top: 26px; bottom: 3px; width: 1px; background: #d5e0c8; }
-.upload-steps li > span { flex-shrink: 0; display: grid; place-items: center; width: 23px; height: 23px; border: 1px solid #d0ddc1; border-radius: 50%; font-size: 9px; }
-.upload-steps strong { font-size: 11px; font-weight: 500; }
-.upload-steps p { font-size: 10px; line-height: 1.7; margin: 6px 0 0; color: #a0af90; }
-.upload-steps .current > span { background: #53764b; border-color: #53764b; color: white; }
-.upload-steps .current strong, .upload-steps .complete { color: #486b3e; }
-.upload-receipt { margin: 0; padding: 14px 0; border-top: 1px solid #d8e2cc; }
+.upload-steps li { position: relative; display: flex; gap: 12px; padding-bottom: 23px; color: #72777d; }
+.upload-steps li:not(:last-child)::after { content: ''; position: absolute; left: 11px; top: 26px; bottom: 3px; width: 1px; background: #c8ccd1; }
+.upload-steps li > span { flex-shrink: 0; display: grid; place-items: center; width: 23px; height: 23px; border: 1px solid #c8ccd1; border-radius: 50%; font-size: 12px; }
+.upload-steps strong { font-size: 14px; font-weight: 500; }
+.upload-steps p { font-size: 12px; line-height: 1.7; margin: 6px 0 0; color: #72777d; }
+.upload-steps .current > span { background: #54595d; border-color: #54595d; color: white; }
+.upload-steps .current strong, .upload-steps .complete { color: #54595d; }
+.upload-receipt { margin: 0; padding: 14px 0; border-top: 1px solid #eaecf0; }
 .upload-receipt > div { margin-bottom: 11px; }
-.upload-receipt dt { color: #92a17f; font-size: 10px; }
-.upload-receipt dd { margin: 5px 0 0; font-size: 11px; line-height: 1.8; color: #647e53; overflow-wrap: anywhere; }
-.upload-result { border-top: 1px solid #d8e2cc; padding-top: 17px; }
+.upload-receipt dt { color: #72777d; font-size: 12px; }
+.upload-receipt dd { margin: 5px 0 0; font-size: 13px; line-height: 1.8; color: #54595d; overflow-wrap: anywhere; }
+.upload-result { border-top: 1px solid #eaecf0; padding-top: 17px; }
 .upload-result h3 { font-size: 13px; line-height: 1.7; font-weight: 500; margin: 0 0 13px; }
 .upload-counts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.upload-counts > span { display: flex; flex-direction: column; gap: 5px; color: #879c75; font-size: 10px; }
-.upload-counts strong { font-size: 24px; font-weight: 400; color: #506f42; }
-.upload-result > p, .upload-reasons { color: #859775; font-size: 10px; line-height: 1.9; }
+.upload-counts > span { display: flex; flex-direction: column; gap: 5px; color: #72777d; font-size: 12px; }
+.upload-counts strong { font-size: 24px; font-weight: 400; color: #54595d; }
+.upload-result > p, .upload-reasons { color: #72777d; font-size: 12px; line-height: 1.9; }
 .upload-reasons { padding-left: 16px; }
-.upload-result .upload-result-boundary { color: #a0ad92; }
-.upload-view-processing { width: 100%; border: 1px solid #c7d5b9; border-radius: 4px; background: #fbfdf7; padding: 9px; color: #637f51; font: inherit; font-size: 11px; cursor: pointer; }
-.upload-persistence { font-size: 10px; color: #a0ae91; line-height: 1.9; margin-bottom: 0; }
-.upload-unavailable { padding: 35px; border: 1px solid #dce3d3; border-radius: 7px; background: #f9fbf5; }
+.upload-result .upload-result-boundary { color: #72777d; }
+.upload-view-processing { width: 100%; border: 1px solid #c8ccd1; border-radius: 4px; background: #ffffff; padding: 9px; color: #54595d; font: inherit; font-size: 13px; cursor: pointer; }
+.upload-persistence { font-size: 12px; color: #72777d; line-height: 1.9; margin-bottom: 0; }
+.upload-unavailable { padding: 35px; border: 1px solid #eaecf0; border-radius: 7px; background: #ffffff; }
 .upload-unavailable h2 { font-size: 18px; font-weight: 500; }
-.upload-unavailable p { font-size: 12px; line-height: 1.8; color: #89977c; }
-button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid #a77e42; outline-offset: 3px; }
+.upload-unavailable p { font-size: 12px; line-height: 1.8; color: #72777d; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid #54595d; outline-offset: 3px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (max-width: 1080px) { .upload-layout { grid-template-columns: minmax(0, 1fr) 265px; gap: 15px; } .upload-panel, .upload-progress { padding: 18px; } }
-@media (max-width: 800px) { .upload-layout { grid-template-columns: minmax(0, 1fr); } .upload-progress { position: static; } .upload-heading { flex-wrap: wrap; } .upload-heading h1 { font-size: 25px; } .upload-fields { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 800px) { .upload-layout { grid-template-columns: minmax(0, 1fr); } .upload-progress { position: static; } .upload-heading { flex-wrap: wrap; } .upload-heading h1 { margin: 0 0 7px; font-size: 27px; font-weight: 600; line-height: 1.4; } .upload-fields { grid-template-columns: minmax(0, 1fr); } }
+.upload-heading { padding-bottom: 18px; border-bottom: 1px solid #a2a9b1; }
+.upload-progress .upload-error, .upload-error { color: #b32424; border-color: #b32424; background: #fff; }
+@media (max-width: 800px) { .upload-progress { border-left: 0; border-top: 1px solid #eaecf0; padding: 24px 0 0; } }
 </style>

@@ -8,6 +8,7 @@ import ts from 'typescript'
 const moduleURL = code => `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
 const apiURL = moduleURL(`
   export class PortalError extends Error { constructor(status) { super('不可读取'); this.status = status } }
+  export async function searchKnowledge(query, signal) { return globalThis.searchPlan(query, signal) }
   export async function getCatalog() { return { items: [], total: 0, offset: 0 } }
   export async function getGraph() { return { nodes: [], edges: [], status: 'ready' } }
   export async function getPublishedKnowledge(id) { return globalThis.readingPlan(id) }
@@ -68,3 +69,28 @@ state.readingOpen.value = false; state.clearReading()
 pending.get('closed')(document('closed')); await closedRequest
 assert.equal(state.reading.value, null, 'closing the drawer invalidates pending responses')
 console.log('Knowledge reading: refresh continuity, version update, switching, access loss and stale responses passed.')
+
+// Search uses the semantic endpoint and cannot expose stale results after a new query or reset.
+globalThis.searchPlan = async query => ({ ok: true, query, result_count: 1, results: [{ knowledge_id: 'semantic', title: '入库核对方法', snippet: '发布后核对全文。' }] })
+state.searchInput.value = '  如何确认同事能搜到资料  '
+await state.runSearch()
+assert.equal(state.searchResults.value.query, '如何确认同事能搜到资料')
+assert.equal(state.searchResults.value.results[0].knowledge_id, 'semantic')
+assert.equal(state.filters.q, '', 'semantic query must not become a title filter')
+const searches = new Map()
+globalThis.searchPlan = (query, signal) => new Promise(done => searches.set(query, { done, signal }))
+state.searchInput.value = '旧问题'; const older = state.runSearch()
+state.searchInput.value = '新问题'; const newer = state.runSearch()
+assert.equal(searches.get('旧问题').signal.aborted, true)
+searches.get('新问题').done({ query: '新问题', result_count: 0, results: [] }); await newer
+searches.get('旧问题').done({ query: '旧问题', result_count: 1, results: [{ knowledge_id: 'stale' }] }); await older
+assert.equal(state.searchResults.value.query, '新问题')
+state.searchInput.value = '关闭问题'; const closing = state.runSearch()
+state.clearSearch()
+searches.get('关闭问题').done({ query: '关闭问题', result_count: 1, results: [{ knowledge_id: 'stale' }] }); await closing
+assert.equal(state.searchResults.value, null)
+globalThis.searchPlan = async () => { throw new PortalError(403) }
+state.searchInput.value = '权限问题'; await state.runSearch()
+assert.equal(state.searchResults.value, null)
+assert(state.searchError.value)
+console.log('Knowledge search: semantic routing, stale responses, cancellation, empty results and permission failure passed.')

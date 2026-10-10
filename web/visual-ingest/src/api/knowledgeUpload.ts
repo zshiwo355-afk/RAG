@@ -72,7 +72,7 @@ export async function putOriginal(value: UploadPackage, result: IntakeResult, si
   if (!result.upload || result.upload.method !== 'PUT' || result.receipt.sha256 !== value.sha256 || result.receipt.byte_length !== value.blob.size) throw new Error('上传授权与当前资料不匹配，请重新申请。')
   const target = new URL(result.upload.url)
   const headers = Object.fromEntries(Object.entries(result.upload.headers).map(([key, val]) => [key.toLowerCase(), val]))
-  if (target.origin !== OSS_ORIGIN || target.username || target.password || target.hash || !target.pathname.startsWith('/knowledge-receipts/raw/')
+  if (target.origin !== OSS_ORIGIN || target.username || target.password || target.hash || !new RegExp('^/knowledge-receipts/raw/[0-9a-f]{32}/' + result.receipt.receipt_id + '/source$').test(decodeURIComponent(target.pathname))
     || headers['content-length'] !== String(value.blob.size) || headers['content-type'] !== 'application/octet-stream'
     || headers['x-oss-object-acl'] !== 'private' || headers['x-oss-forbid-overwrite'] !== 'true'
     || headers['x-oss-meta-sha256'] !== value.sha256 || headers['x-oss-meta-receipt-id'] !== result.receipt.receipt_id

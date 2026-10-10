@@ -236,6 +236,14 @@ export const getCatalog = (filters: { q: string; kind: string; uploader_position
 }
 export const getPublishedKnowledge = (id: string) => request<PublishedKnowledge>(`${API}/catalog/${encodeURIComponent(id)}`)
 
+export interface KnowledgeSearchResult {
+  ok: true
+  query: string
+  result_count: number
+  results: { knowledge_id: string; revision: number; title: string; kind: string; snippet: string; rerank_mode: 'model' | 'fallback_rrf' }[]
+}
+export const searchKnowledge = (query: string, signal?: AbortSignal) => request<KnowledgeSearchResult>(`${API}/search`, 'POST', { query, top_k: 10 }, signal)
+
 export interface GraphNode {
   knowledge_id: string
   title: string
