@@ -378,14 +378,52 @@ class ProcessingStore(ReceiptStore):
                 self._execute(connection, "UPDATE knowledge_processing_jobs SET status='completed',stage='completed',updated_at=? WHERE job_id=? AND status='needs_review'", (self.clock(), job_id))
         return self._public_item(self.item_record(job_id, item_id, principal))
 
-    def retry(self, job_id, principal, actor=None):
+    def retry(self, job_id, principal, actor=None, *, reparse_manifest=False, expected_receipt_id=None,
+              manifest_compatibility=None):
+        if (type(reparse_manifest) is not bool or expected_receipt_id is not None and not reparse_manifest
+                or manifest_compatibility not in (None, "revision_label")
+                or manifest_compatibility is not None and not reparse_manifest):
+            raise ProcessingError("processing_retry_not_allowed", 409)
         with self._connection(write=True) as connection:
             row = self._job(connection, job_id, principal, lock=True)
+            if reparse_manifest:
+                # Operator-only compatibility repair; the HTTP retry route never supplies this opt-in.
+                if (row["status"] != "needs_review" or row["rule_version"] != RULE_VERSION
+                        or row["receipt_id"] != expected_receipt_id or row["lease_token"] is not None
+                        or row["lease_until"] != 0 or not isinstance(actor, str)
+                        or not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,128}", actor)):
+                    raise ProcessingError("processing_retry_not_allowed", 409)
+                receipt = self._execute(connection, """SELECT 1 FROM knowledge_upload_receipts
+                    WHERE receipt_id=? AND principal=? AND status='verified'""",
+                    (expected_receipt_id, row["principal"])).fetchone()
+                items = self._execute(connection, "SELECT * FROM knowledge_processing_items WHERE job_id=?", (job_id,)).fetchall()
+                manifests = [item for item in items if Path(item["source_path"]).name == "交付清单.csv"]
+                prior = self._execute(connection, """SELECT reason_code FROM knowledge_processing_events
+                    WHERE job_id=? AND event_type='retried' AND reason_code IN
+                    ('source_manifest_compatibility','source_revision_label_compatibility')""", (job_id,)).fetchall()
+                reasons = [event["reason_code"] for event in prior]
+                label_repair = manifest_compatibility == "revision_label"
+                if label_repair and (reasons != ["source_manifest_compatibility"] or len(items) != 2):
+                    raise ProcessingError("processing_retry_not_allowed", 409)
+                if (receipt is None or len(manifests) != 1 or len(items) < 2
+                        or any(item["status"] != "needs_review" or any(item[key] is not None for key in (
+                            "knowledge_id", "revision", "content_ref", "publication_json", "resolution_json")) for item in items)
+                        or any(set(json.loads(item["reason_codes"])) != (
+                            {"parse_failed", "source_manifest_invalid"} if not label_repair and item["item_id"] == manifests[0]["item_id"]
+                            else {"unassigned_needs_review"}) for item in items)):
+                    raise ProcessingError("processing_retry_not_allowed", 409)
+                # File-level failure rows have different IDs from successfully parsed assets.
+                # Keep their existing audit events; discard only this pinned job's empty outputs.
+                self._execute(connection, "DELETE FROM knowledge_processing_items WHERE job_id=?", (job_id,))
             result = self._execute(connection, """UPDATE knowledge_processing_jobs SET status='queued',stage='queued',
-                attempts=0,available_at=0,error_code=NULL,updated_at=? WHERE job_id=? AND status='failed'""", (self.clock(), job_id))
+                attempts=0,available_at=0,error_code=NULL,updated_at=? WHERE job_id=? AND status=?""",
+                (self.clock(), job_id, "needs_review" if reparse_manifest else "failed"))
             if result.rowcount != 1:
                 raise ProcessingError("processing_retry_not_allowed", 409)
-            self._event(connection, job_id, "retried", actor=actor or row["principal"])
+            reason = ("source_revision_label_compatibility" if manifest_compatibility == "revision_label"
+                      else "source_manifest_compatibility") if reparse_manifest else None
+            self._event(connection, job_id, "retried", reason,
+                        actor=actor or row["principal"])
         return self.get_job(job_id, principal)
 
 
@@ -439,6 +477,12 @@ class ProcessingService:
         entry["evidence"] = {**evidence, "processing_rule": row["rule_version"],
                              "submitter_authenticated": True, "review_status": "automatic_rule_passed" if not automatic_reasons else "needs_review",
                              "publication_approved": not automatic_reasons, "automatic_rule_reasons": sorted(automatic_reasons)}
+        # The declaration belongs to this authenticated receipt, not the document's audience.
+        entry["evidence"].pop("uploader_attribution", None)
+        position = evidence.get("source_uploader_position")
+        if position and position not in {"未知", "未确认", "待补充", "未取得", "未提供", "待填写"}:
+            entry["evidence"]["uploader_attribution"] = {
+                "position": position, "source": "employee_declared", "receipt_id": row["receipt_id"]}
         base = evidence.get("source_base_revision")
         governed = governance.import_asset(
             {**entry, "content": content}, asset, item_id=item["item_id"], receipt_id=row["receipt_id"],

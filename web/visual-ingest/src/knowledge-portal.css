@@ -32,6 +32,7 @@
 .entry-form form label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 9px; }
 .entry-form input { width: 100%; border: 1px solid #c8ccd1; border-radius: 5px; background: #fff; padding: 13px 14px; color: var(--archive-ink); height: 49px; }
 .entry-form input::placeholder { color: #54595d; }
+.entry-form input + label { margin-top: 20px; }
 .entry-form .field-note { margin: 9px 0 24px; font-size: 13px; color: #54595d; }
 .button { display: inline-flex; align-items: center; justify-content: center; gap: 14px; padding: 9px 16px; border: 1px solid #c8ccd1; border-radius: 5px; background: #fff; color: var(--archive-green); font-weight: 600; font-size: 12px; line-height: 1.6; transition: background .15s; }
 .button:hover:enabled { background: #f8f9fa; }

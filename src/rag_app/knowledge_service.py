@@ -7,7 +7,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
-from . import rerank_service
+from . import knowledge_relevance, rerank_service
 from .config import load_env
 from .knowledge_index import KnowledgeIndex, chunk_document
 from .knowledge_store import AutomaticPublicationConflict, KnowledgeStore, normalize_entry
@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 def public_record(record: dict[str, Any]) -> dict[str, Any]:
     """Expose only reviewed content, never storage paths or draft counters."""
-    return {key: record[key] for key in PUBLIC_FIELDS if key in record}
+    result = {key: record[key] for key in PUBLIC_FIELDS if key in record}
+    if "evidence" in result:
+        result["evidence"] = {key: value for key, value in result["evidence"].items()
+                              if key not in {"uploader_position", "uploader_position_source"}}
+    return result
 
 
 class KnowledgeService:
@@ -147,7 +151,11 @@ class KnowledgeService:
         if not any(item["knowledge_id"] == knowledge_id and item["revision"] == record["revision"]
                    for item in self.store.published_revisions()):
             return None
-        return public_record(record)
+        result = public_record(record)
+        position = self.store.published_uploader_position(record)
+        result["evidence"].update(uploader_position=position,
+                                  uploader_position_source="employee_declared" if position else None)
+        return result
 
     def list_assets(self) -> list[dict[str, Any]]:
         return self.store.list_assets()
@@ -246,6 +254,16 @@ class KnowledgeService:
             if not include_content:
                 asset.pop("content", None)
             rrf_score = sum(1 / (60 + rank) for rank in match["ranks"].values())
+            # A short hit can contain only an intake summary. Verify against the
+            # whole short document, or matched blocks plus their neighbours.
+            evidence = record["content"]
+            if len(evidence) > 6000:
+                ordered_chunks = list(chunks[knowledge_id].values())
+                context = [text for text, _ in hits[:3]]
+                for _, rank in hits[:3]:
+                    position = chunks[knowledge_id][rank[2]]["chunk_index"] - 1
+                    context.extend(chunk["source_text"] for chunk in ordered_chunks[max(0, position - 1):position + 2])
+                evidence = "\n\n".join(dict.fromkeys(context))[:6000]
             candidates.append({
                 **asset, "snippet": hits[0][0], "chunk_id": hits[0][1][2],
                 "retrieval_routes": sorted(match["ranks"]), "rrf_score": rrf_score,
@@ -254,10 +272,11 @@ class KnowledgeService:
                 "_rerank_text": "\n\n".join([
                     f"标题：{record['title'][:200]}", *(text for text, _ in hits[:3]),
                 ])[:1800],
+                "_relevance_text": f"标题：{record['title'][:200]}\n\n{evidence}",
             })
         # Bound model work by assets, independent of how many chunks each has.
         candidates = sorted(candidates, key=lambda item: (-item["rrf_score"], item["knowledge_id"]))[:50]
-        documents = [item.pop("_rerank_text") for item in candidates]
+        documents = [item["_rerank_text"] for item in candidates]
         if not candidates:
             return []
         try:
@@ -271,7 +290,23 @@ class KnowledgeService:
                 item.update(score=score, rerank_score=score, rerank_mode="model")
         except Exception as exc:
             # SDK errors can contain credentials and documents; log only type.
-            logger.warning("Company knowledge rerank unavailable; using RRF (%s)", type(exc).__name__)
+            logger.warning("Company knowledge rerank unavailable (%s)", type(exc).__name__)
+            raise RuntimeError("knowledge rerank unavailable") from None
+        candidates.sort(key=lambda item: (-item["score"], -item["rrf_score"], item["knowledge_id"]))
+        current_pairs = {(item["knowledge_id"], item["revision"]) for item in self.store.published_revisions(**filters)}
+        candidates = [item for item in candidates if (item["knowledge_id"], item["revision"]) in current_pairs]
+        # Exact titles are document navigation. All other queries need evidence,
+        # including high rerank scores: topic similarity cannot prove a fact.
+        exact = [item for item in candidates if item["title"].strip().casefold() == query.strip().casefold()]
+        if exact:
+            candidates = exact
+        else:
+            candidates = candidates[:max(10, top_k)]
+            supported = knowledge_relevance.supported_indices(query.strip(), [item["_relevance_text"] for item in candidates])
+            candidates = [item for i, item in enumerate(candidates) if i in supported]
+        for item in candidates:
+            item.pop("_rerank_text")
+            item.pop("_relevance_text")
         current_pairs = {(item["knowledge_id"], item["revision"]) for item in self.store.published_revisions(**filters)}
         results = [item for item in candidates if (item["knowledge_id"], item["revision"]) in current_pairs]
-        return sorted(results, key=lambda item: (-item["score"], -item["rrf_score"], item["knowledge_id"]))[:top_k]
+        return results[:top_k]

@@ -37,6 +37,19 @@ def _text(value, field, default=None):
     return value.strip()
 
 
+def _uploader_position(record, receipts):
+    snapshot = record.get("evidence", {}).get("uploader_attribution")
+    if not isinstance(snapshot, dict) or snapshot.get("source") != "employee_declared":
+        return None
+    receipt = receipts.get((record["knowledge_id"], record["revision"]))
+    position = snapshot.get("position")
+    if (not receipt or snapshot.get("receipt_id") != receipt
+            or not isinstance(position, str) or not position.strip() or len(position) > 200
+            or re.search(r"[\x00-\x1f\x7f]", position)):
+        return None
+    return position
+
+
 def normalize_entry(entry: dict) -> dict:
     """Validate a draft without touching storage and include its stable hashes."""
     if not isinstance(entry, dict):
@@ -426,6 +439,22 @@ class KnowledgeStore:
             ).fetchone()
             return int(row["total"])
 
+    def _uploader_receipts(self, connection):
+        # Legacy catalogues have no governance table; declarations alone are not attribution.
+        ready = (connection.execute("SELECT to_regclass('knowledge_submissions') AS name").fetchone()["name"]
+                 if self.database_url else connection.execute(
+                     "SELECT name FROM sqlite_master WHERE type='table' AND name='knowledge_submissions'").fetchone())
+        if not ready:
+            return {}
+        rows = connection.execute("""SELECT s.knowledge_id,s.revision,s.receipt_id FROM knowledge_submissions s
+            JOIN knowledge_assets a ON a.knowledge_id=s.knowledge_id AND a.published_revision=s.revision
+            WHERE s.disposition IN ('new','new_revision') AND s.owned_knowledge_id=s.knowledge_id""")
+        return {(row["knowledge_id"], row["revision"]): row["receipt_id"] for row in rows}
+
+    def published_uploader_position(self, record):
+        with self._connection() as connection:
+            return _uploader_position(record, self._uploader_receipts(connection)) if connection is not None else None
+
     def published_catalog(self) -> list[dict]:
         """Project current public metadata without hydrating OSS or newer drafts."""
         with self._connection() as connection:
@@ -436,6 +465,7 @@ class KnowledgeStore:
                 JOIN knowledge_revisions r ON a.knowledge_id = r.knowledge_id
                 AND a.published_revision = r.revision
                 ORDER BY a.published_at DESC, a.knowledge_id""")
+            receipts = self._uploader_receipts(connection)
             result = []
             for row in rows:
                 record = json.loads(row["record_json"])
@@ -446,9 +476,7 @@ class KnowledgeStore:
                     "published_at": row["published_at"], "title": record["title"],
                     "kind": record.get("kind", "未知"), "source_type": evidence.get("source_type"),
                     "scenarios": record.get("scenarios", []),
-                    # Uploads currently carry an authenticated principal, but no
-                    # employee-position snapshot. Department/audience are not it.
-                    "uploader_position": None,
+                    "uploader_position": _uploader_position(record, receipts),
                     "related_knowledge_ids": sorted({item["knowledge_id"] for item in related
                         if isinstance(item, dict) and isinstance(item.get("knowledge_id"), str)})
                         if isinstance(related, list) else [],
@@ -468,6 +496,7 @@ class KnowledgeStore:
                 a.published_at, r.record_json FROM knowledge_assets a
                 JOIN knowledge_revisions r ON a.knowledge_id=r.knowledge_id
                 AND a.published_revision=r.revision ORDER BY a.published_at DESC,a.knowledge_id""")
+            receipts = self._uploader_receipts(connection)
             result = []
             for row in rows:
                 record = json.loads(row["record_json"])
@@ -477,7 +506,7 @@ class KnowledgeStore:
                     "knowledge_id": row["knowledge_id"], "revision": row["revision"],
                     "published_at": row["published_at"], "content_hash": record["content_hash"],
                     "title": record["title"], "kind": record.get("kind", "未知"),
-                    "source_type": evidence.get("source_type"), "uploader_position": None,
+                    "source_type": evidence.get("source_type"), "uploader_position": _uploader_position(record, receipts),
                     "source_namespace": evidence.get("governance_receipt_id"),
                     "source_aliases": [{"name": source.get("name", ""), "locator": source.get("locator", "")}
                                        for source in record.get("sources", [])],

@@ -51,8 +51,9 @@ npm run build -- --base=/portal/knowledge/
 
 ## 会话与接口
 
-- `GET /portal/knowledge/session` 获取会话，`POST` 使用 `{credential}` 登录，`DELETE` 仅退出门户会话。凭据使用密码输入框，不存入浏览器 storage，提交时清空输入。
+- `GET /portal/knowledge/session` 获取会话，`POST` 使用 `{username,password}` 登录，`DELETE` 仅退出门户会话。账号和密码由 MCP 服务端配置及校验，前端不内置密码、不写入浏览器 storage；密码使用密码输入框，提交时清空。账号和密码字段支持浏览器的 `username` / `current-password` 自动填充。
 - 会话由 MCP 的独立 HttpOnly Cookie 维护。所有非 GET 请求带 `X-Knowledge-Portal-Request: 1`，由服务端验证 Origin 和当前权限。
+- 网页只读账号可查看公司知识、公司处理记录、草稿和异常；会话 `capabilities.upload=false` 时隐藏上传入口，旧 `#upload` 链接回到知识目录。`capabilities.review_write=false` 时不提供管理写操作。员工 MCP 工具权限仍由原有授权控制。
 - `GET /portal/knowledge/api/overview?scope=self|company` 获取统计；正式知识无权限时返回 `null`，页面显示无权限，不显示零。
 - `GET /portal/knowledge/api/receipts?scope=self|company&status=...&limit=20&offset=0` 获取分页收件核验历史。支持等待上传、核验中、核验通过、拒收及核验失败；即使未生成处理任务也保留记录。响应只包含编号、文件名、大小、状态、安全原因、时间以及关联任务编号，不返回对象路径、凭据或原文。本人权限只能查询本人，公司明细要求审核权限。`overview.receipt_counts` 单独统计核验状态，不混入内容处理任务失败数量。
 - `GET /portal/knowledge/api/catalog` 获取公司正式知识目录。查询为 `limit=1..100`（默认 50）、`offset=0..1000000`、`q`、`kind`、`uploader_position`；后三项最多 200 字符且不接受 ASCII 控制字符，`uploader_position=unknown` 筛选岗位缺失项。目录不接受 `scope`，天然仅包含公司已公开知识。返回分页 `items/total/limit/offset`、全库 `counts/by_kind/by_uploader_position` 和 `generated_at`；全库汇总不随筛选缩小。
@@ -121,6 +122,7 @@ OSS CORS 需要允许实际门户 Origin 发起 PUT，并允许签名使用的 C
 
 ```sh
 node tests/knowledge-graph.test.mjs
+node tests/knowledge-login.test.mjs
 node tests/knowledge-upload-ui.test.mjs
 node tests/knowledge-upload-package.test.mjs
 node tests/knowledge-reading.test.mjs

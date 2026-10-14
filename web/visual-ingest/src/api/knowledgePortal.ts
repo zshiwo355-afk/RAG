@@ -184,7 +184,7 @@ async function request<T>(path: string, method = 'GET', body?: unknown, signal?:
 
 const scopeQuery = (scope: Scope) => `scope=${scope}`
 export const getSession = () => request<PortalSession>(SESSION)
-export const createSession = (credential: string) => request<PortalSession>(SESSION, 'POST', { credential })
+export const createSession = (username: string, password: string) => request<PortalSession>(SESSION, 'POST', { username, password })
 export const deleteSession = () => request<void>(SESSION, 'DELETE')
 export const getOverview = (scope: Scope) => request<Overview>(`${API}/overview?${scopeQuery(scope)}`)
 export const getReceipts = (scope: Scope, status: ReceiptStatus | '', page: number, pageSize: number, signal?: AbortSignal) => {

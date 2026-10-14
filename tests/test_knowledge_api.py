@@ -200,7 +200,7 @@ def test_fractional_tied_route_rank_keeps_equal_rrf_contribution(service):
     result = service.search("复盘")[0]
     assert result["retrieval_routes"] == ["text_keyword"]
     assert result["rrf_score"] == pytest.approx(1 / 110.5)
-    assert result["rerank_mode"] == "fallback_rrf"
+    assert result["rerank_mode"] == "model"
 
 
 def test_parent_rank_ties_preserve_the_best_chunk_for_reranking(service, monkeypatch):
@@ -382,7 +382,7 @@ def test_department_and_scenario_filters_scope_index_and_final_recheck(service, 
         assert result["knowledge_id"] == "decision-review"
         assert result["department"] == "运营" and result["scenarios"] == ["复盘", "日常汇报"]
         assert service.index.search_calls[-1][1] == [{"knowledge_id": "decision-review", "revision": 1}]
-        assert catalogue_calls == [{"department": "运营", "scenario": "复盘"}] * 3
+        assert catalogue_calls == [{"department": "运营", "scenario": "复盘"}] * 4
         assert len(service.search("复盘", department="运营")) == 2
         assert len(service.search("复盘", scenario="复盘")) == 2
         count = len(service.index.search_calls)
@@ -529,7 +529,7 @@ def test_asset_rrf_merges_routes_once_and_reranks_keyword_only_hits(service, mon
 
 
 @pytest.mark.parametrize("scores", [[], [float("nan"), 0.2], [float("inf"), 0.2], [None, 0.2], [True, 0.2], "error"])
-def test_invalid_or_failed_rerank_falls_back_to_asset_rrf_without_error_leak(service, monkeypatch, caplog, scores):
+def test_invalid_or_failed_rerank_cannot_bypass_relevance_without_error_leak(service, monkeypatch, caplog, scores):
     for knowledge_id in ["first", "second"]:
         service.import_document({**entry(), "knowledge_id": knowledge_id}, execute=True)
         service.publish(knowledge_id, confirmed_by="测试确认人", execute=True)
@@ -542,11 +542,9 @@ def test_invalid_or_failed_rerank_falls_back_to_asset_rrf_without_error_leak(ser
         return scores
 
     monkeypatch.setattr(rerank_service, "call_rerank_model", rerank)
-    results = service.search("方法")
-    assert [item["knowledge_id"] for item in results] == ["first", "second"]
-    assert all(item["rerank_mode"] == "fallback_rrf" and item["rerank_score"] is None
-               and item["score"] == item["rrf_score"] for item in results)
-    assert "using RRF" in caplog.text
+    with pytest.raises(RuntimeError, match="knowledge rerank unavailable"):
+        service.search("方法")
+    assert "rerank unavailable" in caplog.text
     assert "DO_NOT_EXPOSE" not in caplog.text and "internal-source-content" not in caplog.text
 
 
@@ -623,3 +621,103 @@ def test_rerank_keeps_the_best_hit_tail_with_exact_keyword_evidence(service, mon
 
     monkeypatch.setattr(rerank_service, 'call_rerank_model', rerank)
     assert service.search('ZX-913')[0]['rerank_mode'] == 'model'
+
+
+@pytest.mark.parametrize("score", [0.12, 0.96])
+def test_same_topic_without_requested_fact_returns_empty(service, monkeypatch, score):
+    from rag_app import knowledge_relevance
+
+    service.import_document(entry("评测模板：产品、延迟、成功率、负责人均待填写。"), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    monkeypatch.setattr(rerank_service, "call_rerank_model", lambda *args: [score])
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", lambda *args: set())
+    assert service.search("评测项目 EX-87 实际成功率是多少？") == []
+
+
+def test_low_score_answerable_paraphrase_is_not_rejected(service, monkeypatch):
+    from rag_app import knowledge_relevance
+
+    quote = "合并错误可以在七天内回档。"
+    service.import_document(entry(quote), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    monkeypatch.setattr(rerank_service, "call_rerank_model", lambda *args: [0.12])
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", lambda *args: {0})
+    assert [r["knowledge_id"] for r in service.search("重复客户弄错了，一周以内能恢复吗？")] == ["decision-review"]
+
+
+@pytest.mark.parametrize("operation", ["withdraw", "new_revision"])
+def test_visibility_is_rechecked_after_relevance_call(service, monkeypatch, operation):
+    from rag_app import knowledge_relevance
+
+    service.import_document(entry(), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    def judge(query, documents):
+        if operation == "withdraw":
+            service.withdraw("decision-review", execute=True)
+        else:
+            service.import_document(entry("新版本正文"), execute=True)
+            service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+        return {0}
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", judge)
+    assert service.search("复盘怎么做") == []
+
+
+def test_relevance_unavailable_is_retryable_error_not_empty_success(service, monkeypatch):
+    from rag_app import knowledge_relevance
+
+    service.import_document(entry(), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    def unavailable(*args):
+        raise RuntimeError("credential=DO_NOT_EXPOSE private source")
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", unavailable)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_knowledge_service] = lambda: service
+    with TestClient(app) as client:
+        result = client.post("/api/knowledge/search", json={"query": "复盘怎么做"})
+    assert result.status_code == 503
+    assert "DO_NOT_EXPOSE" not in result.text and "results" not in result.json()
+
+
+def test_exact_title_navigation_preserves_access_without_fact_judgment(service, monkeypatch):
+    from rag_app import knowledge_relevance
+
+    service.import_document(entry(), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    def unexpected(*args):
+        pytest.fail("Exact-title navigation does not need a fact check")
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", unexpected)
+    assert service.search(" 决策复盘方法 ")[0]["knowledge_id"] == "decision-review"
+
+
+def test_short_summary_hit_checks_full_body_before_rejecting(service, monkeypatch):
+    from rag_app import knowledge_relevance
+
+    evidence = "启动前收集已确认价格、库存和素材预算。"
+    body = "来源和过程说明。" * 150 + "\n\n" + evidence
+    service.import_document(entry(body), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    service.index.rows = service.index.rows[:1]
+    assert evidence not in service.index.rows[0]["source_text"]
+    def judge(query, documents):
+        assert evidence in documents[0]
+        return {0}
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", judge)
+    result = service.search("活动开始前应该准备哪些资料？")
+    assert len(result) == 1 and not any(k.startswith("_") for k in result[0])
+
+
+def test_withdrawal_during_rerank_never_sends_body_to_relevance(service, monkeypatch):
+    from rag_app import knowledge_relevance
+
+    service.import_document(entry(), execute=True)
+    service.publish("decision-review", confirmed_by="测试确认人", execute=True)
+    def rerank(*args):
+        service.withdraw("decision-review", execute=True)
+        return [0.9]
+    def judge(query, documents):
+        assert documents == []
+        return set()
+    monkeypatch.setattr(rerank_service, "call_rerank_model", rerank)
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", judge)
+    assert service.search("复盘方法") == []

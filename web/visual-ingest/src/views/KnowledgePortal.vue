@@ -7,13 +7,15 @@
         <div v-if="checkingSession" class="entry-check" role="status"><span class="loading-dot" />正在确认登录状态…</div>
         <template v-else>
           <h1 id="login-title">公司知识库</h1>
-          <p class="intro">使用个人 MCP 凭据登录，查看知识和上传记录。</p>
+          <p class="intro">使用账号和密码登录，查看知识和上传记录。</p>
           <div v-if="loginError" class="message error" role="alert">{{ loginError }}</div>
           <form @submit.prevent="login">
-            <label for="knowledge-credential">个人 MCP 凭据</label>
-            <input id="knowledge-credential" v-model="credential" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" :disabled="signingIn || signingOut || logoutUnconfirmed" aria-describedby="credential-hint" required placeholder="粘贴你的个人连接凭据">
-            <p id="credential-hint" class="field-note">向管理员获取个人凭据；不要使用共享管理员账号。</p>
-            <button class="button primary entry-submit" type="submit" :disabled="signingIn || signingOut || !credential.trim() || logoutUnconfirmed">{{ signingIn ? '正在登录…' : '登录知识中心' }}<span aria-hidden="true">→</span></button>
+            <label for="knowledge-username">账号</label>
+            <input id="knowledge-username" v-model="username" name="username" type="text" autocomplete="username" spellcheck="false" autocapitalize="off" :disabled="signingIn || signingOut || logoutUnconfirmed" required placeholder="请输入账号">
+            <label for="knowledge-password">密码</label>
+            <input id="knowledge-password" v-model="password" name="password" type="password" autocomplete="current-password" :disabled="signingIn || signingOut || logoutUnconfirmed" aria-describedby="password-hint" required placeholder="请输入密码">
+            <p id="password-hint" class="field-note">请输入管理员提供的登录账号和密码。</p>
+            <button class="button primary entry-submit" type="submit" :disabled="signingIn || signingOut || !username.trim() || !password || logoutUnconfirmed">{{ signingIn ? '正在登录…' : '登录知识中心' }}<span aria-hidden="true">→</span></button>
           </form>
           <button v-if="logoutUnconfirmed" class="button subtle" :disabled="signingOut" @click="logout">重试退出登录</button>
           <button v-else-if="initialCheckFailed" class="button subtle" @click="checkSession">重新检查连接</button>
@@ -25,7 +27,7 @@
     <div v-else class="portal-shell" :class="{ 'graph-mode': activeView === 'graph' }">
       <aside class="portal-sidebar" aria-label="知识中心导航">
         <a class="wordmark" href="/rag/knowledge">公司知识库</a>
-        <nav class="knowledge-navigation"><a v-for="entry in views" :key="entry.key" :href="`#${entry.key}`" class="sidebar-nav" :class="{ 'sidebar-active': activeView === entry.key }" :aria-current="activeView === entry.key ? 'page' : undefined">{{ entry.label }}</a></nav>
+        <nav class="knowledge-navigation"><a v-for="entry in visibleViews" :key="entry.key" :href="`#${entry.key}`" class="sidebar-nav" :class="{ 'sidebar-active': activeView === entry.key }" :aria-current="activeView === entry.key ? 'page' : undefined">{{ entry.label }}</a></nav>
 
       </aside>
 
@@ -69,7 +71,7 @@
         <div class="detail-intro"><span class="status-badge" :class="selectedJob.status"><span />{{ statusName(selectedJob.status) }}</span><span>{{ stageName(selectedJob.stage) }}</span><button v-if="canReviewWrite && selectedJob.retryable" class="button primary" :disabled="retrying || resolving || detailPaging" @click="retrySelected">{{ retrying ? '正在提交…' : '重新处理' }}</button></div>
         <div v-if="actionError" class="message error" role="alert">{{ actionError }}</div>
         <div v-if="actionNotice" class="message success" role="status">{{ actionNotice }}</div>
-        <p v-if="canReview && !canReviewWrite" class="message notice">处理操作暂未启用。当前可以查看记录，写操作由 MCP 管理员配置。</p>
+        <p v-if="canReview && !canReviewWrite" class="message notice">当前账号仅可查看处理记录。</p>
         <p v-if="selectedJob.error_code" class="message error">原处理原因：{{ reasonName(selectedJob.error_code) }}</p>
         <p v-if="selectedJob.status === 'needs_review'" class="message notice">这份资料需要进一步核对。补齐材料后重新提交，或记录原因并归档；原件和处理过程会保留。</p>
         <dl class="job-metadata"><div><dt>收件编号</dt><dd>{{ selectedJob.receipt_id }}</dd></div><div><dt>任务编号</dt><dd>{{ selectedJob.job_id }}</dd></div><div><dt>来源标识</dt><dd>{{ selectedJob.source_id || '未提供' }}</dd></div><div><dt>处理规则</dt><dd>{{ selectedJob.rule_version }}</dd></div><div><dt>创建时间</dt><dd>{{ formatDate(selectedJob.created_at) }}</dd></div><div><dt>已尝试</dt><dd>{{ selectedJob.attempts }} 次</dd></div></dl>
@@ -127,7 +129,9 @@ function hashChanged() { activeView.value = readView() }
 function showProcessing(value = '') { window.location.hash = 'processing'; status.value = value; filterJobs() }
 function visibleRefresh() { if (document.visibilityState === 'visible' && navigator.onLine && session.value && !overviewLoading.value && !jobsLoading.value) void refresh() }
 const session = ref<PortalSession | null>(null)
-const credential = ref('')
+const visibleViews = computed(() => views.filter(entry => entry.key !== 'upload' || session.value?.capabilities?.upload === true))
+const username = ref('')
+const password = ref('')
 const checkingSession = ref(true)
 const signingIn = ref(false)
 const signingOut = ref(false)
@@ -199,7 +203,7 @@ function clearDetail() { clearResolution(); detailRequest++; selectedJob.value =
 function clearPrivateData() {
   sessionGeneration++; overviewRequest++; jobsRequest++; session.value = null
   overview.value = null; jobs.value = []; jobsTotal.value = null; detailOpen.value = false; clearDetail()
-  overviewLoading.value = false; jobsLoading.value = false; overviewError.value = ''; jobsError.value = ''; credential.value = ''
+  overviewLoading.value = false; jobsLoading.value = false; overviewError.value = ''; jobsError.value = ''; username.value = ''; password.value = ''
 }
 function handleError(error: unknown) {
   if (error instanceof PortalError && error.status === 401) { clearPrivateData(); loginError.value = '登录已过期，请重新登录。' }
@@ -216,13 +220,13 @@ async function checkSession() {
   finally { checkingSession.value = false }
 }
 async function login() {
-  if (!credential.value.trim() || signingIn.value || signingOut.value || logoutUnconfirmed.value) return
+  if (!username.value.trim() || !password.value || signingIn.value || signingOut.value || logoutUnconfirmed.value) return
   signingIn.value = true; loginError.value = ''; initialCheckFailed.value = false
   const generation = sessionGeneration
-  const pending = createSession(credential.value.trim())
-  credential.value = ''
+  const pending = createSession(username.value.trim(), password.value)
+  password.value = ''
   try { const result = await pending; if (generation !== sessionGeneration) return; session.value = result; scope.value = initialScope(result); page.value = 1; status.value = ''; await refresh() }
-  catch (error) { loginError.value = error instanceof PortalError && error.status === 401 ? '凭据无效或已停用，请检查你的个人 MCP 连接凭据。' : errorMessage(error) }
+  catch (error) { loginError.value = error instanceof PortalError && error.status === 401 ? '账号或密码不正确，请重新输入。' : errorMessage(error) }
   finally { signingIn.value = false }
 }
 async function logout() {
@@ -327,6 +331,7 @@ async function showPreview(item: ProcessingItem) {
   catch (error) { if (requestId === previewRequest) previewError.value = handleError(error) }
   finally { if (requestId === previewRequest) previewLoading.value = false }
 }
+watch([session, activeView], () => { if (session.value && activeView.value === 'upload' && !session.value.capabilities?.upload) { activeView.value = 'overview'; window.location.hash = 'overview' } })
 watch(scope, () => { overview.value = null; jobs.value = []; jobsTotal.value = null; page.value = 1; detailOpen.value = false; clearDetail(); void refresh() })
 watch(viewTitle, value => { document.title = `公司知识中心 · ${value}` }, { immediate: true })
 onMounted(() => {

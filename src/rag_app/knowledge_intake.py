@@ -28,6 +28,8 @@ SOURCE_COLUMNS = ("资产编号", "名称", "类型", "状态", "用途", "正�
 SOURCE_GOVERNANCE_COLUMNS = {"基线修订": "source_base_revision", "共享范围": "source_sharing",
                              "使用对象": "source_audience", "输入": "source_inputs", "输出": "source_outputs",
                              "依赖与权限": "source_dependencies", "适用边界": "source_boundaries"}
+SOURCE_UPLOADER_COLUMN = "上传员工岗位"
+SOURCE_REVISION_LABEL = re.compile(r"[1-9][0-9]{3}-(?:0[1-9]|1[0-2])")
 SOURCE_TYPES = {"方法": "method", "流程": "process", "模板": "template", "提示词": "prompt",
                 "Skill方法": "method", "案例": "case", "规则": "policy", "参考": "reference"}
 MAX_ARCHIVE = 512 * 1024 * 1024
@@ -223,7 +225,7 @@ def scan_package(source, cache):
                             columns = tuple(rows[0]) if rows else ()
                             if (columns[:len(SOURCE_COLUMNS)] != SOURCE_COLUMNS
                                     or len(columns) != len(set(columns))
-                                    or not set(columns[len(SOURCE_COLUMNS):]).issubset(SOURCE_GOVERNANCE_COLUMNS)
+                                    or not set(columns[len(SOURCE_COLUMNS):]).issubset({*SOURCE_GOVERNANCE_COLUMNS, SOURCE_UPLOADER_COLUMN})
                                     or any(len(row) != len(columns) for row in rows[1:])):
                                 raise ValueError("source_manifest_invalid")
                             documents[name]["csv_rows"] = [dict(zip(columns, (clean_text(cell)[0].strip() for cell in row))) for row in rows[1:]]
@@ -276,8 +278,11 @@ def _source_manifest(report, documents):
                 raise ValueError("source_manifest_invalid_row")
             ids[key.casefold()] = row
             base = row.get("基线修订", "")
-            if base and not re.fullmatch(r"[1-9][0-9]{0,8}", base):
+            if base and not re.fullmatch(r"[1-9][0-9]{0,8}", base) and not SOURCE_REVISION_LABEL.fullmatch(base):
                 raise ValueError("source_manifest_invalid_base_revision")
+            position = row.get(SOURCE_UPLOADER_COLUMN, "")
+            if len(position) > 200 or re.search(r"[\x00-\x1f\x7f]", position):
+                raise ValueError("source_manifest_invalid_uploader_position")
             if state == "交付":
                 path = row["正文路径"].replace("\\", "/")
                 if (not path or path.startswith(("/", "~")) or ":" in path or "\x00" in path
@@ -315,6 +320,9 @@ def _source_manifest(report, documents):
         return names[0], delivered
     except ValueError as error:
         report["issues"].append({"code": str(error)})
+        if names[0] in documents:
+            # Preserve semantic failures through the worker's existing file-item audit.
+            documents[names[0]]["item"]["issues"].append({"code": str(error)})
         return names[0], {}
 
 
@@ -577,6 +585,11 @@ def _prepare_assets(source, report, documents):
                                         source_limitations=row["限制与待办"], source_approval=False)
             metadata["evidence"].update({field: row[column] for column, field in SOURCE_GOVERNANCE_COLUMNS.items()
                                          if row.get(column)})
+            if SOURCE_REVISION_LABEL.fullmatch(row.get("基线修订", "")):
+                # A legacy calendar label is provenance, never a catalogue revision pin.
+                metadata["evidence"]["source_revision_label"] = metadata["evidence"].pop("source_base_revision")
+            if row.get(SOURCE_UPLOADER_COLUMN):
+                metadata["evidence"]["source_uploader_position"] = row[SOURCE_UPLOADER_COLUMN]
             if row["类型"] == "Skill方法":
                 metadata["evidence"]["delivery_scope"] = "method_reference_only"
         asset = {"knowledge_id": asset_id, "metadata": metadata, "content": body,

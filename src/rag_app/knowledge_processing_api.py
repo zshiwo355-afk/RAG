@@ -230,7 +230,7 @@ def published_detail(knowledge_id: str = Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-
         "knowledge_id", "title", "revision", "published_at", "content",
     )}, "kind": category, "kind_label": CATALOG_KINDS[category],
         "source_kind": record.get("kind", "未知"), "scenarios": record.get("scenarios", []),
-        "uploader_position": None, "summary": None}
+        "uploader_position": _call(catalog.published_uploader_position, record), "summary": None}
 
 
 @router.get("/overview")

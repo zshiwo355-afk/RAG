@@ -48,12 +48,13 @@ def isolate_unit_tests_from_cloud(request, monkeypatch):
 @pytest.fixture(autouse=True)
 def offline_rerank_no_network(request, monkeypatch):
     if request.node.get_closest_marker("offline") is not None:
-        from rag_app import rerank_service
+        from rag_app import knowledge_relevance, rerank_service
 
-        def unavailable(*args, **kwargs):
-            raise RuntimeError("offline rerank fixture; tests may provide deterministic scores")
+        def scores(query, documents):
+            return [0.5] * len(documents)
 
-        monkeypatch.setattr(rerank_service, "call_rerank_model", unavailable)
+        monkeypatch.setattr(rerank_service, "call_rerank_model", scores)
+        monkeypatch.setattr(knowledge_relevance, "supported_indices", lambda query, documents: set(range(len(documents))))
 
 
 @pytest.fixture

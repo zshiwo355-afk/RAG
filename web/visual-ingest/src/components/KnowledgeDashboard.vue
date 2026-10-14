@@ -33,7 +33,7 @@
         <div v-else-if="searchError" class="message error" role="alert">{{ searchError }} <button class="text-button" @click="runSearch">重试</button></div>
         <template v-else-if="searchResults">
           <p v-if="searchResults.results.some(item => item.rerank_mode === 'fallback_rrf')" class="filter-result">精排暂不可用，当前显示初步匹配结果，请核对原文。</p>
-          <div v-if="!searchResults.result_count" class="list-state"><h3>没有找到匹配资料</h3><p>尝试补充具体场景或换一种问法。</p></div>
+          <div v-if="!searchResults.result_count" class="list-state" role="status"><h3>未找到足够相关资料</h3><p>尝试补充具体场景或换一种问法，也可以清除搜索后浏览全部资料。</p><button class="button subtle" @click="resetFilters">浏览全部资料</button></div>
           <ol v-else class="semantic-list"><li v-for="asset in searchResults.results" :key="asset.knowledge_id"><button class="asset-title" @click="openKnowledge(asset.knowledge_id)">{{ asset.title }}</button><p class="semantic-snippet">{{ asset.snippet }}</p><button class="text-button" :aria-label="`阅读 ${asset.title}`" @click="openKnowledge(asset.knowledge_id)">阅读全文</button></li></ol>
         </template>
       </section>

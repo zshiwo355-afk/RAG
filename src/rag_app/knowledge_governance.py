@@ -21,9 +21,11 @@ _HASH = re.compile(r"[0-9a-f]{64}")
 _VOLATILE_EVIDENCE = {
     "receipt_id", "processing_rule", "processing", "review_status", "source_verified",
     "publication_approved", "source_approval", "model_review", "source_asset_id",
-    "source_base_revision", "base_revision", "submission_id", "submitted_at",
+    "source_base_revision", "source_revision_label", "base_revision", "submission_id", "submitted_at",
     "submitter_authenticated", "automatic_rule_reasons", "auto_publish",
     "governance_attachment_hash", "governance_fingerprint_version", "governance_receipt_id",
+    "source_uploader_position", "uploader_attribution",
+    "uploader_position", "uploader_position_source",
 }
 _UNKNOWN_ATTACHMENTS = {
     "script_dependency_not_provided", "referenced_material_unparsed", "unresolved_reference",

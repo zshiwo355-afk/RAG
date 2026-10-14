@@ -85,6 +85,10 @@ assert.equal(searches.get('旧问题').signal.aborted, true)
 searches.get('新问题').done({ query: '新问题', result_count: 0, results: [] }); await newer
 searches.get('旧问题').done({ query: '旧问题', result_count: 1, results: [{ knowledge_id: 'stale' }] }); await older
 assert.equal(state.searchResults.value.query, '新问题')
+assert.equal(state.searchResults.value.result_count, 0)
+assert.equal(state.searchError.value, '')
+assert(source.includes('未找到足够相关资料'))
+assert(source.includes('@click="resetFilters">浏览全部资料'))
 state.searchInput.value = '关闭问题'; const closing = state.runSearch()
 state.clearSearch()
 searches.get('关闭问题').done({ query: '关闭问题', result_count: 1, results: [{ knowledge_id: 'stale' }] }); await closing
@@ -92,5 +96,9 @@ assert.equal(state.searchResults.value, null)
 globalThis.searchPlan = async () => { throw new PortalError(403) }
 state.searchInput.value = '权限问题'; await state.runSearch()
 assert.equal(state.searchResults.value, null)
+assert(state.searchError.value)
+globalThis.searchPlan = async () => { throw new PortalError(503) }
+state.searchInput.value = '服务故障'; await state.runSearch()
+assert.equal(state.searchResults.value, null, 'service failure must not be shown as no relevant knowledge')
 assert(state.searchError.value)
 console.log('Knowledge search: semantic routing, stale responses, cancellation, empty results and permission failure passed.')
