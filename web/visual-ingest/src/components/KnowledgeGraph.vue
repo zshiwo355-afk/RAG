@@ -12,9 +12,10 @@
       <div class="scope-buttons" aria-label="图谱探索范围"><button type="button" :aria-pressed="depth === 0" @click="depth = 0">全局</button><button type="button" :aria-pressed="depth === 1" :disabled="!selectedNode" @click="depth = 1">1 跳</button><button type="button" :aria-pressed="depth === 2" :disabled="!selectedNode" @click="depth = 2">2 跳</button></div>
     </div>
     <div v-if="!canRead" class="graph-state"><h3>当前账号未开放知识图谱</h3><p>管理员可通过现有角色配置知识查看权限。</p></div>
-    <div v-else-if="error" class="graph-state graph-failure" role="alert"><h3>图谱暂时无法读取</h3><p>{{ error }}</p><button type="button" @click="loadGraph">重新读取</button></div>
+    <div v-else-if="error && !data" class="graph-state graph-failure" role="alert"><h3>图谱暂时无法读取</h3><p>{{ error }}</p><button type="button" @click="loadGraph">重新读取</button></div>
     <div v-else-if="!data" class="graph-state" role="status"><span class="network-loading" /><h3>正在加载图谱</h3><p>读取当前正式知识和有依据的关系。</p></div>
     <template v-else>
+      <div v-if="error" class="graph-status" role="alert">更新暂未完成，保留上次读取的图谱。{{ error }} <button type="button" class="graph-text-button" @click="loadGraph">重试</button></div>
       <div v-if="data.status !== 'ready'" class="graph-status" role="status"><span class="status-dot" />{{ data.status === 'building' ? '关系索引正在更新' : '部分关系尚未完成处理' }} · 已处理 {{ data.counts.indexed_assets }} / {{ data.counts.published_assets }} 项知识<span v-if="data.counts.failed_assets"> · {{ data.counts.failed_assets }} 项处理失败</span>。现有结果可继续探索。</div>
       <div v-if="!data.nodes.length" class="graph-state"><span class="empty-orbit" aria-hidden="true">◎</span><h3>{{ data.counts.published_assets ? '关系正在准备中' : '暂无已发布知识' }}</h3><p>{{ data.counts.published_assets ? '后台更新完成后，知识节点会自动显示。' : '正式知识发布后，会成为图中的一个节点。' }}</p></div>
       <template v-else>
@@ -61,7 +62,7 @@
               <section class="edge-evidence"><h4>依据摘录</h4><article v-for="(evidence, index) in currentEvidence" :key="`${evidence.knowledge_id}-${index}`"><blockquote>{{ evidence.excerpt }}</blockquote><button type="button" class="graph-text-button" @click="emit('select', evidence.knowledge_id)">{{ nodeTitle(evidence.knowledge_id) }} · v{{ evidence.revision }} ↗</button></article><p v-if="!currentEvidence.length" class="inspector-muted">暂未提供当前正式版本的摘录，可阅读两端知识核对。</p></section>
             </template>
             <template v-else-if="selectedNode">
-              <div class="inspector-kicker">当前知识 <button type="button" class="graph-text-button" aria-label="收起知识详情" @click="inspectorOpen = false">×</button></div><span class="node-type">{{ kindLabel(selectedNode.kind) }} · v{{ selectedNode.revision }}</span><h3>{{ selectedNode.title }}</h3><p class="inspector-muted">上传员工岗位：{{ selectedNode.uploader_position || '待补充岗位' }}</p><button type="button" class="read-knowledge" @click="emit('select', selectedNode.knowledge_id)">阅读全文 <span aria-hidden="true">↗</span></button>
+              <div class="inspector-kicker">当前知识 <button type="button" class="graph-text-button" aria-label="收起知识详情" @click="inspectorOpen = false">×</button></div><span class="node-type">{{ kindLabel(selectedNode.kind) }} · 版本 {{ selectedNode.revision }}</span><h3>{{ selectedNode.title }}</h3><p class="inspector-muted">上传员工岗位：{{ selectedNode.uploader_position || '待补充岗位' }}</p><button type="button" class="read-knowledge" @click="emit('select', selectedNode.knowledge_id)">阅读全文 <span aria-hidden="true">↗</span></button>
               <div class="focus-actions"><button type="button" @click="focusNode(1)">查看 1 跳连接</button><button type="button" @click="focusNode(2)">查看 2 跳连接</button></div>
               <section v-for="section in connectionSections" :key="section.label" class="connections-list"><h4>{{ section.label }}<span>{{ section.items.length }}</span></h4><p v-if="!section.items.length" class="inspector-muted">暂无{{ section.label }}</p><div v-for="edge in section.items" :key="edge.id" class="connection-item"><button type="button" @click="selectNode(otherEnd(edge))">{{ nodeTitle(otherEnd(edge)) }}</button><button type="button" class="connection-evidence" :aria-label="`查看与${nodeTitle(otherEnd(edge))}的关系依据`" @click="selectEdge(edge.id)">依据 ↗</button></div></section>
             </template>
@@ -75,11 +76,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
-import { getGraph, type GraphData, type GraphEdge } from '../api/knowledgePortal'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, useId, watch } from 'vue'
+import { getGraph, PortalError, type GraphData, type GraphEdge } from '../api/knowledgePortal'
 import { GRAPH_LIMIT, chooseKnowledgeLabels, fitKnowledge, layoutKnowledge, neighborhood, zoomKnowledge, type GraphPoint } from './knowledgeGraphLayout'
 
-const props = defineProps<{ refreshKey: number; canRead: boolean }>()
+const props = defineProps<{ refreshKey: number; canRead: boolean; fetchGraph?: (signal?: AbortSignal) => Promise<GraphData> }>()
 const emit = defineEmits<{ select: [knowledgeId: string]; error: [error: unknown] }>()
 const data = ref<GraphData | null>(null)
 const loading = ref(false)
@@ -108,7 +109,11 @@ const pan = ref({ x: 0, y: 0 })
 const dragging = ref(false)
 let dragOrigin = { x: 0, y: 0, panX: 0, panY: 0, pointerId: -1 }
 let requestId = 0
+let requestController: AbortController | undefined
+const active = ref(true)
+let progressTimer: ReturnType<typeof setTimeout> | undefined
 let layoutTopology = ''
+let graphSignature = ''
 let manualView = false
 let resizeObserver: ResizeObserver | undefined
 const nodesById = computed(() => new Map((data.value?.nodes || []).map(node => [node.knowledge_id, node])))
@@ -143,31 +148,56 @@ const connectionSections = computed(() => [
   { label: '入链', items: validEdges.value.filter(edge => edge.relation === 'reference' && edge.target === selectedId.value) },
   { label: '内容相关', items: validEdges.value.filter(edge => edge.relation === 'related' && (edge.source === selectedId.value || edge.target === selectedId.value)) },
 ])
-const kindNames: Record<string, string> = { sop: 'SOP / 流程', skill: 'Skill', case: '案例', template: '模板', prompt: '提示词', method: '方法', policy: '规则', reference: '参考', other: '其他' }
-const kindLabel = (value: string) => kindNames[value] || value || '其他'
+const kindNames: Record<string, string> = { sop: '岗位流程', process: '岗位流程', skill: '智能体技能', case: '案例', template: '模板', prompt: '提示词', method: '方法', policy: '规则', reference: '参考', other: '其他' }
+const kindLabel = (value: string) => kindNames[value] || '其他'
 const nodeTitle = (id: string) => nodesById.value.get(id)?.title || '当前不可见的知识'
 const shorten = (value: string, limit: number) => Array.from(value).length > limit ? `${Array.from(value).slice(0, limit).join('')}…` : value
 const pointFor = (id: string) => points.value.get(id) || { x: 460, y: 310 }
 const otherEnd = (edge: GraphEdge) => edge.source === selectedId.value ? edge.target : edge.source
 
+const visibleOnline = () => active.value && (typeof document === 'undefined' || document.visibilityState === 'visible' && navigator.onLine)
+function scheduleProgress() {
+  clearTimeout(progressTimer)
+  progressTimer = undefined
+  if (typeof document !== 'undefined' && props.canRead && data.value?.status === 'building' && visibleOnline()) progressTimer = setTimeout(() => { void loadGraph() }, 2000)
+}
+function pauseGraph() {
+  clearTimeout(progressTimer); progressTimer = undefined; requestId++
+  requestController?.abort(); requestController = undefined; loading.value = false
+  resizeObserver?.disconnect()
+  dragging.value = false
+  if (svg.value?.hasPointerCapture(dragOrigin.pointerId)) svg.value.releasePointerCapture(dragOrigin.pointerId)
+}
+function resumeProgress() {
+  if (!visibleOnline()) { pauseGraph(); return }
+  observeCanvas()
+  void loadGraph()
+}
 async function loadGraph() {
-  if (!props.canRead) return
+  if (!props.canRead || loading.value || !visibleOnline()) return
+  clearTimeout(progressTimer)
   const current = ++requestId
+  requestController = new AbortController()
   loading.value = true; error.value = ''
   try {
-    const result = await getGraph()
+    const result = await (props.fetchGraph ? props.fetchGraph(requestController.signal) : getGraph(requestController.signal))
     if (current !== requestId) return
+    const signature = JSON.stringify([result.nodes, result.edges, result.status, result.counts, result.truncated])
+    if (signature === graphSignature) return
+    graphSignature = signature
     data.value = result
     const ids = new Set(result.nodes.map(node => node.knowledge_id))
-    points.value = new Map([...points.value].filter(([id]) => ids.has(id)))
+    if ([...points.value.keys()].some(id => !ids.has(id))) points.value = new Map([...points.value].filter(([id]) => ids.has(id)))
     if (!ids.has(selectedId.value)) { selectedId.value = ''; depth.value = 0 }
     if (!result.edges.some(edge => edge.id === selectedEdgeId.value)) selectedEdgeId.value = ''
   } catch (reason) {
     if (current !== requestId) return
-    data.value = null; points.value = new Map(); clearSelection()
+    if (reason instanceof PortalError && [401, 403].includes(reason.status)) {
+      graphSignature = ''; layoutTopology = ''; data.value = null; points.value = new Map(); clearSelection()
+    }
     error.value = reason instanceof Error ? reason.message : '连接暂不可用，请稍后重试。'
     emit('error', reason)
-  } finally { if (current === requestId) loading.value = false }
+  } finally { if (current === requestId) { requestController = undefined; loading.value = false; scheduleProgress() } }
 }
 function clearSelection() { selectedId.value = ''; selectedEdgeId.value = ''; depth.value = 0; inspectorOpen.value = false }
 function clearFilters() { search.value = ''; kind.value = ''; position.value = ''; depth.value = 0 }
@@ -207,6 +237,7 @@ function wheelZoom(event: WheelEvent) {
 }
 watch([visibleNodes, visibleEdges], () => {
   const topology = JSON.stringify([visibleNodes.value.map(node => node.knowledge_id).sort(), visibleEdges.value.map(edge => `${edge.source}:${edge.target}:${edge.relation}`).sort()])
+  if (topology === layoutTopology) return
   const next = layoutKnowledge(visibleNodes.value, visibleEdges.value, points.value, !!layoutTopology && topology !== layoutTopology)
   layoutTopology = topology
   points.value = new Map([...points.value, ...next])
@@ -214,11 +245,13 @@ watch([visibleNodes, visibleEdges], () => {
 })
 watch([search, kind, position, depth, () => depth.value ? selectedId.value : ''], resetView, { flush: 'post' })
 watch(() => props.refreshKey, () => { if (!loading.value) void loadGraph() })
-watch(() => props.canRead, value => { if (value) void loadGraph(); else { requestId++; data.value = null; points.value = new Map(); clearSelection(); loading.value = false; error.value = '' } })
-watch(svg, element => {
+watch(() => props.canRead, value => { if (value) resumeProgress(); else { pauseGraph(); graphSignature = ''; layoutTopology = ''; data.value = null; points.value = new Map(); clearSelection(); error.value = '' } })
+function observeCanvas() {
   resizeObserver?.disconnect()
-  if (!element) return
+  const element = svg.value
+  if (!element || !props.canRead || !visibleOnline()) return
   const resize = () => {
+    if (!visibleOnline()) return
     const bounds = element.getBoundingClientRect()
     if (bounds.width < 1 || bounds.height < 1) return
     canvasSize.value = { width: bounds.width, height: bounds.height }
@@ -227,9 +260,26 @@ watch(svg, element => {
   resizeObserver = new ResizeObserver(resize)
   resizeObserver.observe(element)
   resize()
-}, { flush: 'post' })
-onMounted(loadGraph)
-onBeforeUnmount(() => { requestId++; resizeObserver?.disconnect(); data.value = null; points.value = new Map() })
+}
+watch(svg, observeCanvas, { flush: 'post' })
+onActivated(() => { active.value = true; resumeProgress() })
+onDeactivated(() => { active.value = false; pauseGraph() })
+onMounted(() => {
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', resumeProgress)
+    window.addEventListener('online', resumeProgress)
+    window.addEventListener('offline', resumeProgress)
+  }
+  return loadGraph()
+})
+onBeforeUnmount(() => {
+  active.value = false; pauseGraph(); data.value = null; points.value = new Map()
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', resumeProgress)
+    window.removeEventListener('online', resumeProgress)
+    window.removeEventListener('offline', resumeProgress)
+  }
+})
 </script>
 
 <style scoped>

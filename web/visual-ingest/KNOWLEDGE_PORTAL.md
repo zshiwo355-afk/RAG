@@ -4,12 +4,24 @@
 
 ## 页面与统计口径
 
-入口包含“知识总览”“知识图谱”“上传资料”“上传与异常”四个视图，通过 `#overview`、`#graph`、`#upload`、`#processing` 切换；没有识别到视图片段时打开总览。
+侧栏保留“岗位知识”“知识图谱”“上传与异常”；有上传能力的账号仍显示原有“上传资料”入口。“上传与异常”内部通过概览卡片分别打开正式知识、收件记录、需要关注和待发布内容，不为各列表增加侧栏菜单。正式知识进入全库浏览；其余列表仍通过 `#receipts`、`#attention`、`#pending_publication` 独立切换，统一高亮“上传与异常”。岗位知识、图谱和上传分别保留 `#overview`、`#graph`、`#upload`。旧 `#processing` 打开收件记录；没有识别到视图片段时打开岗位目录。每次只渲染当前视图的列表。
 
-- 总览展示公司当前正式知识总量、类型分布、上传员工岗位分布，以及当前账号获授权范围内的上传记录和异常任务。目录支持标题搜索、类型和岗位筛选，每页 20 项；点击条目读取当前正式版本全文。
-- 正式知识按当前已发布的知识 ID 计数，版本更新和重复提交不重复计数。类型包括 SOP / 流程、Skill、案例、方法、模板、提示词、规则、参考和其他。`kind=method` 且原始 `source_type=Skill方法` 的条目归入 Skill；从来源拆出的 `reference_case` 仍计为案例，`reference_overview` 仍计为参考。
-- 岗位口径是**上传员工所属岗位**，不使用适用岗位、部门、姓名或 MCP 授权角色推断。当前上传协议与身份链路没有可信的员工岗位快照，目录岗位字段全部为 `null`，显示“待补充岗位”，归属岗位数为 0；这些知识仍计入总量且可以阅读。后续需接入可信岗位快照，不能靠前端填造分布。
-- 上传数量采用已有 `overview.counts.receipts`：当前授权范围内已创建的收件记录总数，包含尚未核验和未成功处理的记录，不等于上传成功数或正式知识数。异常数为 `needs_review + failed` 任务数。
+### 独立追踪页面与岗位状态（2026-10-20）
+
+- 概览卡片直接导航至独立页面。收件、关注、待发布各自保存范围、名称、已确认部门/岗位、状态、起止日期及分页。筛选值保存在 hash 的页面前缀参数中，例如 `#attention?attention.processing_status=needs_review&receipts.page=2`，刷新和前进后退可恢复各页状态；不保存凭据或完整收件内容。`job` 参数定位任务详情，旧页内详情按钮保持兼容。
+- 同一身份和统计范围内切页保留概览；返回同一任务查询或缓存的收件页时保留上次结果并后台更新，避免先清空再重绘。首次未加载的页面仍显示正常加载提示。身份、权限、范围或查询改变时清除不适用的数据；收件页停用时取消在途读取，返回时重新读取收件及岗位目录。
+- 服务端在分页前筛选。任务原 `status` 保留 `attention` / `pending_publication` 分组；`processing_status` 是分组内状态筛选。收件 `status` 仍表示原件核验，内容处理另用 `processing_status`。共同参数为 `q`、`department`、`role_id`、`created_from`、`created_to`；起点包含，终点不包含。界面日期按北京时间转换，所选结束日包含整日。
+- 收件持续显示原上传声明、逐项确认归属、原件核验、内容处理、剩余原因与关联详情。岗位摘要最多五条，显示剩余数量；详情分页内每个条目携带 `role_assignment`。摘要批量读取，列表不会逐行请求详情。缺失字段的旧响应继续可读，不推断未知岗位或发布成功。
+- 岗位确认只消除确实已解决的本条岗位原因；缺附件、内容冲突、来源关系及其他条目仍保留。选择与实时处理结果分开显示，不用历史 `requeued` 判断当前进度。已确认岗位默认收起编辑，保存失败/版本冲突保留选择，未保存时提示并保护关闭、翻页与离开。
+- `attention_jobs` 与关注列表使用一致口径；局部重新检查期间，同一任务里仍待处理的其他条目继续进入关注。`attention_required` 让排队/处理中仍有独立阻塞的任务显示剩余问题。`current_reason_codes` / `rechecking` 用于当前展示，原 `reason_codes` 保留审计语义。已发布资料仅读取。
+
+本地验证使用合成资料、临时 SQLite、内存对象存储和索引测试替身；不代表生产部署、真实 OSS/向量检索或员工客户端验收。
+
+- 首页读取独立岗位目录，按 SOP 中的部门和岗位分组；没有资料的岗位仍展示。点击岗位进入 SOP、Skill、其他三个分类，各分类显示该岗位的数量和空态，列表每页 20 项。保留全库浏览和未归属资料入口。
+- 正式知识按当前已发布的知识 ID 计数，版本更新和重复提交不重复计数。后端细类型继续保留；SOP / 流程归入 SOP，Skill 与 `source_type=Skill方法` 的方法归入 Skill，案例、模板、提示词等归入其他。完整 Skill 包只依据文件的 `purpose=skill` 标记；普通原件或方法说明不冒充完整可执行交付。
+- 资产所属岗位使用标准 `role_id`；上传员工岗位仍单独作为来源信息展示，不能用适用对象或 MCP 授权角色推断所属岗位。历史未归属资料保留在全库及“未归属资料”中。
+- 岗位内语义搜索保留当前岗位与分类，清除搜索仍停留在当前分类。未归属资料使用明确标注的标题过滤，不转成全库语义搜索。
+- 上传数量采用已有 `overview.counts.receipts`：当前授权范围内已创建的收件记录总数，包含尚未核验和未成功处理的记录，不等于上传成功数或正式知识数。关注数采用 `attention_jobs`，包括局部重新检查时仍有其他未解决条目的任务；旧响应回退为 `needs_review + failed`。
 
 ## Wiki 知识关系网络
 
@@ -23,13 +35,15 @@
 
 ## 自动更新
 
-页面已登录、可见且浏览器联网时，每 30 秒刷新概览、上传列表，以及当前视图的正式目录或 `/graph`；恢复联网或重新切回可见页面也会触发刷新。正在加载概览或上传列表时跳过当次自动刷新。页面隐藏、离线或未登录时暂停自动请求，仍提供手动刷新。
+页面已登录、可见且浏览器联网时，每 30 秒确认会话和权限；处理中任务按该周期刷新当前视图，稳定页面每 5 分钟刷新数据。图谱返回 `building` 时单独每 2 秒读取进度，保留已有节点，串行请求避免与父页面刷新重叠；`ready` 后停止快速轮询。图谱轮询不额外读取会话、概览或隐藏列表。恢复联网或重新切回可见页面也会触发刷新；页面隐藏、离线、离开图谱或未登录时停止对应轮询，仍提供手动刷新。
 
-自动上传的新知识通过正常发布规则后，会在下一次成功刷新进入目录、统计和图谱节点，关系在后台特征读取完成后补齐；异常任务进入“上传与异常”。这是定期读取实际状态，不是实时推送。已打开的处理详情也会刷新并保留资料/事件页码；正在翻页加载、编辑异常表单或提交写操作时暂停详情自动刷新，避免覆盖用户输入。已打开的正式正文与它的关联会随当前视图刷新重新读取；知识撤回或失去读取权限时不继续保留旧正文。
+自动上传的新知识通过正常发布规则后，会在下一次成功刷新进入目录、统计和图谱节点，关系在后台特征读取完成后补齐；异常任务进入“需要关注”。这是定期读取实际状态，不是实时推送。已打开的处理详情也会刷新并保留资料/事件页码；正在翻页加载、编辑异常表单或提交写操作时暂停详情自动刷新，避免覆盖用户输入。已打开的正式正文与它的关联会随当前视图刷新重新读取；知识撤回或失去读取权限时不继续保留旧正文。
 
-图谱使用 API 进程内派生缓存，每个进程最多缓存两个目录身份；不保存完整原文、不写 PostgreSQL/OSS。最多 4 个后台线程读取缺失正文，成功特征按知识 ID、修订、内容哈希和发布时间缓存；新增、换版或同修订撤回再发布会补读，普通私有草稿修改不重读有效公开版本。待处理任务总量最多 1,000 个，过期排队任务读取前再次检查；失败至少等待 60 秒、在后续请求中重试。进程重启后重新构建，首轮可返回 `building`，页面保留已有结果并展示处理进度。
+图谱复用 API 进程内缓存，并在既有知识目录数据库的 `knowledge_graph_features` 派生表持久保存每篇特征，不保存完整原文或改写 OSS。特征按知识 ID、算法版本、修订、内容哈希和发布时间核验；新增、换版、撤回后重新发布或损坏缓存会补读，普通私有草稿修改不重读有效公开版本。每个进程最多缓存两个目录身份，最多 4 个后台线程读取缺失正文；待处理任务总量最多 1,000 个，过期排队任务读取前再次检查，失败至少等待 60 秒后按后续请求重试。新进程先恢复持久特征；缓存有效时原文读取为零，但仍查询目录并计算关系。缺失特征时可返回 `building`，页面保留已有结果并展示进度。
 
-每个目录的派生边仅在发布快照或完成特征集合变化时重算，常规轮询不重复读 OSS 或重复计算词项关联；但每次请求仍校验权限，并在响应结束前重读最新发布快照，过滤撤回、替换及相应旧证据。服务端最多处理当前 1,000 份正式知识、返回 2,000 条边，响应预算小于 3 MiB；超限用 `truncated` 明示，失败或截断用 `partial` 标示。这一图谱模块不新增数据库 schema、依赖、环境变量或处理 Worker 行为。
+每个目录的派生边仅在发布快照、相关元数据或完成特征集合变化时重算，常规轮询不重复读 OSS 或重复计算词项关联；但每次请求仍校验权限，并在响应结束前重读最新发布快照，过滤撤回、替换及相应旧证据。服务端最多处理当前 1,000 份正式知识、返回 2,000 条边，响应预算小于 3 MiB；超限用 `truncated` 明示，失败或截断用 `partial` 标示。部署需显式初始化新增派生表；读取路径不会隐式迁移 PostgreSQL，表不可用时仍可使用进程内缓存。发布成功提交后使用已有正文异步预热特征，失败不影响发布结果；不新增依赖或环境变量。
+
+同一身份和权限范围内切页保留图谱实例、布局、缩放、筛选和选中状态；离开时暂停轮询与尺寸观察，返回后重新核对数据，相同内容不重新布局。临时请求失败保留有效画面并允许重试，401/403 清除相关缓存。此状态仅在当前页面会话中保留，浏览器整页刷新会重置视角；不写入 localStorage 或 sessionStorage。
 
 ## 开发与构建
 
@@ -41,13 +55,15 @@ npm run build
 
 开发时 `/portal/knowledge` 默认代理到 `http://127.0.0.1:9001`，可通过 `KNOWLEDGE_PORTAL_PROXY_TARGET` 指定本地 MCP 服务。MCP 的门户允许 Origin 需要配置为开发网页的实际 Origin，例如 `http://127.0.0.1:5174`；仅限本地开发。
 
-门户与现有 MCP 网页同域部署时，使用单独的构建命令：
+门户与现有 MCP 网页同域部署时，使用单独的构建命令（包含类型检查）：
 
 ```sh
-npm run build -- --base=/portal/knowledge/
+npm run build:knowledge
 ```
 
-由 MCP 入口提供 `/portal/knowledge/assets/*`，并在 `/rag/knowledge` 返回这份构建的 `index.html`。业务 API 与静态资源必须在同一域名；不要把内部 RAG Bearer 交给浏览器。该构建目录是生成物，不提交到源码。部署完毕需验证静态路径、Cookie、Origin 和反向代理，不以本地 build 通过替代上线验证。
+正式门户产物只取 `dist/knowledge/`，其中 `index.html` 的资源引用以 `/portal/knowledge/assets/` 开头；打包时以该目录为根，不把本地演示或默认构建的 `dist/index.html` 混入。原 `npm run build` 保持不变，继续输出到 `dist/` 根目录；先运行默认构建会清理 `dist/`，因此需要两种产物时最后运行 `build:knowledge`。
+
+由 MCP 入口提供 `/portal/knowledge/assets/*`，并在 `/rag/knowledge` 返回正式门户产物的 `index.html`。业务 API 与静态资源必须在同一域名；不要把内部 RAG Bearer 交给浏览器。构建目录是生成物，不提交到源码。部署完毕需验证静态路径、Cookie、Origin 和反向代理，不以本地 build 通过替代上线验证。
 
 ## 会话与接口
 
@@ -56,14 +72,18 @@ npm run build -- --base=/portal/knowledge/
 - 网页只读账号可查看公司知识、公司处理记录、草稿和异常；会话 `capabilities.upload=false` 时隐藏上传入口，旧 `#upload` 链接回到知识目录。`capabilities.review_write=false` 时不提供管理写操作。员工 MCP 工具权限仍由原有授权控制。
 - `GET /portal/knowledge/api/overview?scope=self|company` 获取统计；正式知识无权限时返回 `null`，页面显示无权限，不显示零。
 - `GET /portal/knowledge/api/receipts?scope=self|company&status=...&limit=20&offset=0` 获取分页收件核验历史。支持等待上传、核验中、核验通过、拒收及核验失败；即使未生成处理任务也保留记录。响应只包含编号、文件名、大小、状态、安全原因、时间以及关联任务编号，不返回对象路径、凭据或原文。本人权限只能查询本人，公司明细要求审核权限。`overview.receipt_counts` 单独统计核验状态，不混入内容处理任务失败数量。
-- `GET /portal/knowledge/api/catalog` 获取公司正式知识目录。查询为 `limit=1..100`（默认 50）、`offset=0..1000000`、`q`、`kind`、`uploader_position`；后三项最多 200 字符且不接受 ASCII 控制字符，`uploader_position=unknown` 筛选岗位缺失项。目录不接受 `scope`，天然仅包含公司已公开知识。返回分页 `items/total/limit/offset`、全库 `counts/by_kind/by_uploader_position` 和 `generated_at`；全库汇总不随筛选缩小。
-- `GET /portal/knowledge/api/catalog/{knowledge_id}` 不接受查询参数，读取当前正式全文及类型、修订、发布时间、场景和岗位字段。`knowledge_id` 是 1..80 位字母、数字、下划线或连字符，以字母或数字开头。草稿和已撤回知识返回 404；正文作为纯文本展示，不执行包内 HTML、Markdown 或命令。
+- `GET /portal/knowledge/api/roles` 返回 `{items:[{role_id,department,name,counts:{sop,skill,other},total}]}`。岗位目录独立于已发布资产计数，不在前端从已有资料推造岗位。
+- `GET /portal/knowledge/api/catalog` 获取公司正式知识目录。查询为 `limit=1..100`（默认 50）、`offset=0..1000000`、`q`、`kind`、`uploader_position`，并支持 `role_id` 和 `category=sop|skill|other`。`role_id=unknown` 筛选未归属资料，省略为全库；目录不接受 `scope`，仅包含公司已公开知识。返回分页和原有全库汇总，岗位三类数量以 roles 返回值为准。
+- `POST /portal/knowledge/api/search` 使用 `{query,top_k,role_id?,category?}`。岗位 ID 只传标准岗位值；空筛选字段不传。
+- `GET /portal/knowledge/api/catalog/{knowledge_id}` 读取当前正式全文及类型、修订、发布时间、场景、`role_id/department/role_name` 和 `files`。文件描述包含 `file_id/filename/media_type/byte_length/sha256/purpose`，purpose 为 original、preview 或 skill；历史资料允许 files 为空。草稿和已撤回知识返回 404；正文作为纯文本显示。
+- `GET /portal/knowledge/api/catalog/{knowledge_id}/files/{file_id}?disposition=inline|attachment` 按需返回 `{url,expires_in,filename,media_type}`。下载每次重新申请，不持久保存签名 URL。前端只接受 HTTPS 或同源地址；仅页面本身为本机开发地址时允许本机 HTTP fixture。预览使用不开放脚本、同源能力的 sandbox iframe，并禁止发送 referrer；切换资料、版本变化、关闭预览、链接到期或失去权限时清除预览链接。文件缺失显示不可下载说明，正文仍可读。中文字体、表格、分页和原件哈希须通过本地真实文档验收，不以编译通过代替预览效果。
 - `GET /portal/knowledge/api/graph` 不接受查询参数，只读公司当前正式知识网络；MCP 转发到 RAG 的 `GET /api/rag/knowledge-processing/graph`。返回 `nodes/edges/status/counts/truncated/generated_at`。节点使用 `knowledge_id/title/kind/revision/uploader_position`；边使用 `id/source/target/relation/label/directed/reason/evidence/terms`，`relation` 为 `reference` 或 `related`，每段证据标注 `knowledge_id/revision/excerpt`。`counts` 包括 `published_assets/indexed_assets/failed_assets/explicit_edges/related_edges`，`status` 为 `building/ready/partial`；索引数量不等于正式资产总量。
 - `GET /portal/knowledge/api/jobs?scope=self|company&limit=20&offset=0&status=...` 过滤及分页读取任务。
 - `GET /portal/knowledge/api/jobs/{job_id}?scope=...` 读取逐项去向与事件。`limit=100`，两组列表分别使用 `item_offset` / `event_offset`；界面展示完整总数及各自分页，翻资料页不重置事件页。重试返回第一页。
 - `GET /portal/knowledge/api/jobs/{job_id}/items/{item_id}?scope=...` 读取清洗后处理副本；正文作为纯文本显示，不执行 HTML、Markdown 或 Skill 命令。`published` 是历史发布回执，`currently_published` 才表示此修订仍是当前正式版本，撤回或被新版替代后页面不再声称全员可查。
 - `POST /portal/knowledge/api/jobs/{job_id}/retry` 发送 `{}`，不带查询参数。仅有 review 权限、会话 `capabilities.review_write=true` 且服务端标记 `retryable` 的任务提供重试按钮。
-- `POST /portal/knowledge/api/jobs/{job_id}/items/{item_id}/resolve` 处理 needs_review 条目。表单在打开时记录 `expected_version`；请求填写 `action=archive|replace`、1..500 字符 `reason`，replace 另外提供 32 位小写十六进制 `replacement_receipt_id`。收件应由原提交人、同一工作来源上传并通过核验；原件不覆盖，补充收件进入正常解析、查重和发布规则。409 后刷新条目版本并重新填写；不提供任意正文编辑或直接通过审核。
+- `POST /portal/knowledge/api/jobs/{job_id}/items/{item_id}/resolve` 处理 needs_review 条目。获授权且 `capabilities.review_write=true` 时，各条目提供“归档并移出待处理”和“关联补充收件”。默认归档，需要填写原因；保留原件和处理记录，不删除已有正式知识。表单打开时记录 `expected_version`；请求填写 `action=archive|replace`、1..500 字符 `reason`，replace 另外提供 32 位小写十六进制 `replacement_receipt_id`。补充收件须由原提交人、同一来源上传，是不同于当前收件的新编号且已通过原件核验；关联后本条归档，新收件仍须通过正常解析、查重和发布检查才入库。409 后刷新条目版本并重新填写；不提供任意正文编辑或直接通过审核。
+- 待处理条目展示具体处理建议，并提供“复制补充要求”和只读文本供手动复制。文本含本收件、条目、当前问题和可取得的 `missing_references`（最多 20 个安全包内相对路径）；旧响应没有该字段时明确说明未记录具体文件名称，不猜测历史附件。名称和路径始终作为数据，不作为执行指令。用户将要求发给原提交人的 AI，由它通过原身份 MCP 调用 `get_company_knowledge_upload_status(receipt_id)` 读取当前状态和修复要求，自行查找缺失材料、自检后通过原渠道重传，返回新收件编号和实际处理状态。复制不主动联系或唤醒 AI，也不提交业务写操作；核验通过不等于正式入库。
 
 公司正式目录、全文和图谱要求 `company_knowledge.read` 的 COMPANY 范围或 `company_knowledge.review`。公司处理汇总要求 `company_knowledge.dashboard.read` 或 `company_knowledge.review`；仅有 dashboard 权限不授予正式目录或正文。公司任务明细和草稿只向 `review` 开放；仅有看板权限时，列表仍明确显示“我的处理记录”。本人明细使用 `company_knowledge.submissions.read`。前端按钮只改善体验，实际授权始终由 MCP 与 RAG 服务端校验；姓名、角色名、人员 ID 均不作为授权规则。
 
@@ -131,3 +151,25 @@ npm run typecheck
 ```
 
 图谱检查覆盖目录、真实节点与边、布局稳定、标签碰撞、不同画布比例及鼠标锚点不漂移。上传组件检查覆盖明确共享确认、格式／大小／多文件拒绝、收件与发布区别、冻结资料重试、失败收件重新核验、历史任务分页定位、权限变化清理、取消与超时。真实打包及签名安全由独立 `knowledge-upload-package.test.mjs` 检查。上述测试不会上传真实业务资料或改变生产知识库。
+
+
+## 2026-10-17 岗位确认（本地实现，尚未部署）
+
+以下保留 10 月 17 日的历史设计记录，不代表当前发布状态。现行绑定按具体资料及完整原始部门＋岗位声明处理，不使用共享账号的全局默认岗位；当前页面规则见文首 10 月 20 日说明。
+
+在“上传与异常 → 查看”详情中增加“确认岗位归属”，按部门筛选标准岗位。只有同时具备 REVIEW 权限和 `capabilities.uploader_role_write=true` 的会话才显示控件；旧版服务未提供该能力时仍按原页面工作。
+
+保存的是该资料真实上传人的默认岗位，原始“上传岗位”声明继续展示。当前已记住的归属、保存结果和内容待处理原因分开展示。只有满足后端安全条件的岗位问题才能重新排队，不能通过选择岗位跳过缺附件、脚本或内容检查。已发布资料保持原有岗位；后续新来源使用确认的默认岗位。
+
+组件通过现有同源门户调用 `GET/POST jobs/{job_id}/uploader-role`，提交仅含 `role_id` 和 `expected_version`，不允许客户端指定上传人。保存中禁止重复操作，409 后读取最新岗位和版本再供人工选择；切换任务、退出或失去能力后，过期响应不能恢复旧数据。同一上传人的多条待处理记录可分别应用已经记住的岗位。
+
+MCP 独立开关默认关闭，需配合 RAG 显式初始化新表；开启岗位确认不等于开启原上传、重试、归档权限。迁移、部署与线上验收未执行。本地验证命令：`node --test tests/knowledge-*.test.mjs`、`npm run build:knowledge`。
+
+
+### 已有部门内添加岗位与审核卡点（同轮增强，尚未部署）
+
+部门选项从当前 `GET roles` 的已保存目录去重取得，不在前端硬编码。岗位下拉增加“＋ 添加岗位…”，填写名称后“添加并设为默认岗位”顺序调用 `POST roles` 与当前任务的岗位绑定接口。服务端拒绝目录外部门，同部门同名重复请求复用原岗位。创建成功但默认绑定失败时明确显示“岗位已在目录中，但默认岗位尚未保存”，可以重试绑定；任务切换或卸载后的旧响应不能为另一个上传人保存默认岗位。创建岗位沿用 `uploader_role_write` 能力，不新增宽泛写权限。
+
+处理列表及详情根据后端当前 `blocking_reasons` 显示待处理环节、原因和下一步，覆盖岗位匹配、岗位信息或归属冲突、内容冲突、版本、缺引用附件/脚本、交付信息、共享、来源和正文解析等检查。列表显示前两个原因并提供“查看全部问题”；详情显示当前任务的汇总和分页逐项建议，使用 `blocking_reasons_truncated` 明示截断。岗位继续使用现有确认组件，独立新资料继续使用来源确认选项；需补齐的资料交给原 AI 经 MCP 查询后修复重传，系统失败使用已有重试入口，无需入库的待处理条目可填写原因后归档。历史事件和已归档/发布项不作为当前问题。旧接口未提供汇总时，在详情可从当前待审项回退；列表不猜测具体原因，明确标记阶段未取得。
+
+此处“需要审核”表示展示现有待处理的具体原因，没有新增对全部资料强制审批或跳过发布检查的操作。前端回归增加岗位创建部分失败、跨任务过期响应、部门边界以及审核原因展示；`node --test tests/knowledge-*.test.mjs` 共 9 个测试文件通过。

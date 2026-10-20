@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import io
 import json
 import re
@@ -153,6 +154,88 @@ def _paragraph(node):
     )
 
 
+def _heading_level(node, styles=None):
+    properties = node.find(W + "pPr")
+    if properties is None:
+        return None
+    outline = properties.find(W + "outlineLvl")
+    if outline is not None and outline.get(W + "val", "").isdigit():
+        return min(6, int(outline.get(W + "val")) + 1) if int(outline.get(W + "val")) < 9 else None
+    style = properties.find(W + "pStyle")
+    name = style.get(W + "val", "") if style is not None else ""
+    match = re.fullmatch(r"(?:Heading|标题)\s*([1-6])", name, re.I)
+    return int(match.group(1)) if match else (styles or {}).get(name)
+
+
+def _docx_styles(archive):
+    if "word/styles.xml" not in archive.namelist():
+        return {}
+    styles = {}
+    for node in ET.fromstring(archive.read("word/styles.xml")).findall(W + "style"):
+        name = node.find(W + "name")
+        outline = node.find(W + "pPr/" + W + "outlineLvl")
+        match = re.fullmatch(r"(?:heading|标题)\s*([1-6])", name.get(W + "val", ""), re.I) if name is not None else None
+        if outline is not None and outline.get(W + "val", "") in set("012345"):
+            styles[node.get(W + "styleId")] = int(outline.get(W + "val")) + 1
+        elif match:
+            styles[node.get(W + "styleId")] = int(match.group(1))
+    return styles
+
+
+def _table_rows(block):
+    return [["\n".join(_paragraph(p) for p in cell.iter(W + "p")) for cell in row.findall(W + "tc")]
+            for row in block.findall(W + "tr")]
+
+
+def _paired_steps(left, right):
+    """Join only adjacent, explicitly numbered step tables with the same keys."""
+    if (len(left) < 2 or len(right) < 2 or not left[0] or not right[0]
+            or left[0][0].strip() not in {"步骤", "步骤号"} or right[0][0].strip() not in {"步骤", "步骤号"}
+            or not any("验收" in cell for cell in right[0])):
+        return None
+    keys = [row[0].strip() for row in left[1:] if row]
+    other = {row[0].strip(): row for row in right[1:] if row}
+    if (not all(re.fullmatch(r"\d+", key) for key in keys) or len(set(keys)) != len(left) - 1
+            or len(other) != len(right) - 1 or set(keys) != set(other)
+            or any(len(row) != len(left[0]) for row in left) or any(len(row) != len(right[0]) for row in right)):
+        return None
+    return [left[0] + right[0][1:]] + [row + other[row[0].strip()][1:] for row in left[1:]]
+
+
+def _markdown_row(cells):
+    return "| " + " | ".join(cell.replace("|", "\\|").replace("\n", "<br>") for cell in cells) + " |"
+
+
+def _empty_docx_auxiliary(archive, name):
+    part = PurePosixPath(name).stem
+    root = ET.fromstring(archive.read(name))
+    if root.tag != W + part or any(text.strip() for text in root.itertext()):
+        return False
+    if set(root.attrib) - {"{http://schemas.openxmlformats.org/markup-compatibility/2006}Ignorable"}:
+        return False
+    if part == "comments":
+        return len(root) == 0
+    # Ignore only standard separator scaffolding; unknown content still needs review.
+    for note in root:
+        kind = note.get(W + "type")
+        if (note.tag != W + part[:-1] or kind not in {"separator", "continuationSeparator"}
+                or set(note.attrib) - {W + "type", W + "id"}
+                or not re.fullmatch(r"-?\d+", note.get(W + "id", ""))):
+            return False
+        children = {note.tag: {W + "p"}, W + "p": {W + "pPr", W + "r"},
+                    W + "pPr": {W + "spacing"}, W + "r": {W + kind}}
+        attributes = {
+            W + "p": {W + key for key in ("rsidR", "rsidRDefault", "rsidP", "rsidDel")} |
+                     {"{http://schemas.microsoft.com/office/word/2010/wordml}" + key for key in ("paraId", "textId")},
+            W + "spacing": {W + key for key in ("before", "after", "line", "lineRule")},
+        }
+        if (any(child.tag not in children.get(node.tag, set()) for node in note.iter() for child in node)
+                or any(set(node.attrib) - attributes.get(node.tag, set()) for node in note.iter() if node is not note)
+                or len(list(note.iter(W + kind))) != 1):
+            return False
+    return True
+
+
 def _docx(archive, issues):
     root = ET.fromstring(archive.read("word/document.xml"))
     body = root.find(W + "body")
@@ -160,24 +243,139 @@ def _docx(archive, issues):
         raise _ParseFailure("invalid_docx_body")
     if any(node.tag in {W + "drawing", W + "pict", W + "altChunk", W + "object"} for node in body.iter()):
         _issue(issues, "docx_nontext_content_not_parsed")
-    if any(re.match(r"word/(?:header\d*|footer\d*|footnotes|endnotes|comments)\.xml$", name) for name in archive.namelist()):
+    if any(not _empty_docx_auxiliary(archive, name) for name in archive.namelist()
+           if re.fullmatch(r"word/(?:footnotes|endnotes|comments)\.xml", name)):
         _issue(issues, "docx_auxiliary_parts_not_parsed")
-    paragraph, table = 0, 0
-    for block in body:
+    styles = _docx_styles(archive)
+    paragraph, table, skipped = 0, 0, set()
+    blocks = list(body)
+    for index, block in enumerate(blocks):
+        if index in skipped:
+            continue
         if block.tag == W + "p":
             paragraph += 1
-            yield _paragraph(block), {"kind": "paragraph", "paragraph": paragraph}
+            level = _heading_level(block, styles)
+            text = _paragraph(block)
+            yield ("#" * level + " " + text.replace("\n", " ") if level and text.strip() else text), {
+                "kind": "heading" if level else "paragraph", "paragraph": paragraph,
+            }
         elif block.tag == W + "tbl":
             table += 1
             if block.find(".//" + W + "tbl") is not None:
                 _issue(issues, "docx_nested_table_flattened", table=table)
-            for row_number, row in enumerate(block.findall(W + "tr"), 1):
-                cells = ["\n".join(_paragraph(p) for p in cell.iter(W + "p")) for cell in row.findall(W + "tc")]
-                yield "[表格 %d 行 %d] %s" % (table, row_number, json.dumps(cells, ensure_ascii=False)), {
-                    "kind": "table_row", "table": table, "row": row_number,
-                }
+            rows = _table_rows(block)
+            next_index = index + 1
+            while next_index < len(blocks) and blocks[next_index].tag == W + "p" and not _paragraph(blocks[next_index]).strip():
+                next_index += 1
+            paired = _paired_steps(rows, _table_rows(blocks[next_index])) if next_index < len(blocks) and blocks[next_index].tag == W + "tbl" else None
+            source_tables = [table]
+            if paired:
+                rows = paired
+                source_tables.append(table + 1)
+                skipped.add(next_index)
+            rectangular = len(rows) > 1 and all(len(row) == len(rows[0]) for row in rows)
+            for row_number, cells in enumerate(rows, 1):
+                text = _markdown_row(cells) if rectangular else "[表格 %d 行 %d] %s" % (table, row_number, json.dumps(cells, ensure_ascii=False))
+                if rectangular and row_number == 1:
+                    text += "\n" + _markdown_row(["---"] * len(cells))
+                if row_number == len(rows):
+                    text += "\n" if rectangular else ""
+                yield text, {"kind": "table_row", "table": table, "row": row_number, "source_tables": source_tables}
+            if paired:
+                table += 1
         elif block.tag != W + "sectPr":
             _issue(issues, "docx_unsupported_block_not_parsed")
+    for name in sorted(archive.namelist()):
+        match = re.fullmatch(r"word/(header|footer)\d*\.xml", name)
+        if not match:
+            continue
+        auxiliary = ET.fromstring(archive.read(name))
+        if auxiliary.tag not in {W + "hdr", W + "ftr"}:
+            _issue(issues, "docx_auxiliary_parts_not_parsed")
+            continue
+        if any(node.tag in {W + "drawing", W + "pict", W + "object"} for node in auxiliary.iter()):
+            _issue(issues, "docx_nontext_content_not_parsed")
+        texts = [_paragraph(p) for p in auxiliary.iter(W + "p") if _paragraph(p).strip()]
+        if texts:
+            yield "\n# " + ("页眉" if match.group(1) == "header" else "页脚") + "\n" + "\n".join(texts), {"kind": match.group(1), "part": name}
+
+
+def _sop_metadata(archive):
+    body = ET.fromstring(archive.read("word/document.xml")).find(W + "body")
+    title = " ".join(_paragraph(p) for p in list(body)[:8] if p.tag == W + "p")
+    if not re.search(r"岗位.*(?:SOP|标准作业|操作流程)|SOP.*岗位", title, re.I):
+        return None
+    values = {"所属部门": set(), "岗位名称": set(), "文档名称": set()}
+    for block in body.findall(W + "tbl"):
+        for row in _table_rows(block):
+            for index, cell in enumerate(row[:-1]):
+                key = cell.strip().rstrip("：:")
+                if key == "所属公司及部门":
+                    key = "所属部门"
+                if key in values and row[index + 1].strip():
+                    values[key].add(row[index + 1].strip())
+    if all(len(values[key]) == 1 for key in ("所属部门", "岗位名称")):
+        department, role_name = next(iter(values["所属部门"])), next(iter(values["岗位名称"]))
+        if all(len(value) <= 120 and "待确认" not in value for value in (department, role_name)):
+            metadata = {"department": department, "role_name": role_name}
+            if len(values["文档名称"]) == 1:
+                document_name = next(iter(values["文档名称"]))
+                if len(document_name) <= 240 and "待确认" not in document_name:
+                    metadata["document_name"] = document_name
+            return metadata
+    return None
+
+
+def docx_html_preview(data: bytes, filename: str = "文档.docx") -> bytes:
+    """Text/table preview: no active content, external requests or local files."""
+    if not isinstance(data, bytes) or len(data) > MAX_FILE_BYTES or not isinstance(filename, str):
+        raise ValueError("invalid_preview_input")
+    try:
+        fragments, length, issues = [], 0, []
+        with _office_archive(data, issues) as archive:
+            styles = _docx_styles(archive)
+            parts = ["word/document.xml"] + sorted(name for name in archive.namelist() if re.fullmatch(r"word/(?:header|footer)\d*\.xml", name))
+            for name in parts:
+                root = ET.fromstring(archive.read(name))
+                body = root.find(W + "body") if name == "word/document.xml" else root
+                if body is None:
+                    raise _ParseFailure("invalid_docx_body")
+                if name != "word/document.xml":
+                    fragments.append("<h2>" + ("页眉" if "/header" in name else "页脚") + "</h2>")
+                for block in body:
+                    if block.tag == W + "p":
+                        text = _paragraph(block)
+                        length += len(text)
+                        level = _heading_level(block, styles)
+                        tag = "h" + str(level) if level else "p"
+                        fragments.append("<" + tag + ">" + html.escape(text).replace("\n", "<br>") + "</" + tag + ">")
+                    elif block.tag == W + "tbl":
+                        fragments.append("<table>")
+                        for number, row in enumerate(_table_rows(block)):
+                            fragments.append("<tr>")
+                            for cell in row:
+                                length += len(cell)
+                                tag = "th" if number == 0 else "td"
+                                fragments.append("<" + tag + ">" + html.escape(cell).replace("\n", "<br>") + "</" + tag + ">")
+                            fragments.append("</tr>")
+                        fragments.append("</table>")
+                    if length > MAX_TEXT_CHARS:
+                        raise _ParseFailure("preview_character_limit")
+            # Describe omitted rich content using the same parser's fixed codes.
+            parsed = _collect(_docx(archive, issues), issues)
+            if parsed["issues"]:
+                fragments.insert(0, "<p>文本预览未包含或未执行部分内容：" + html.escape(", ".join(item["code"] for item in parsed["issues"])) + "。完整内容请下载原件。</p>")
+        return ("<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">"
+                "<title>" + html.escape(filename) + "</title><style>"
+                "body{max-width:1100px;margin:32px auto;padding:0 20px;font:16px/1.65 system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:#17212b}"
+                "table{border-collapse:collapse;width:100%;margin:18px 0;overflow-wrap:anywhere}th,td{border:1px solid #ccd2d8;padding:8px;text-align:left;vertical-align:top}th{background:#f2f5f8}p{white-space:pre-wrap}"
+                "</style><body>" + "".join(fragments) + "</body></html>").encode("utf-8")
+    except _ParseFailure as exc:
+        raise ValueError(str(exc)) from None
+    except Exception:
+        raise ValueError("preview_failed") from None
 
 
 def _xlsx(data, issues):
@@ -314,7 +512,11 @@ def parse_text_file(name: str, data: bytes) -> dict:
             return _collect(iter([(text, {"kind": "lines", "start_line": 1})]), issues)
         if suffix in {".docx", ".xlsx"}:
             with _office_archive(data, issues) as archive:
-                return _collect(_docx(archive, issues) if suffix == ".docx" else _xlsx(data, issues), issues)
+                result = _collect(_docx(archive, issues) if suffix == ".docx" else _xlsx(data, issues), issues)
+                metadata = _sop_metadata(archive) if suffix == ".docx" else None
+                if metadata:
+                    result["sop_metadata"] = metadata
+                return result
         if suffix == ".pdf":
             return _collect(_pdf(data, issues), issues)
         raise _ParseFailure("unsupported_file_type")

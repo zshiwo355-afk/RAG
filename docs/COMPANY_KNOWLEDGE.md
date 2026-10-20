@@ -8,16 +8,17 @@
 
 - PostgreSQL `knowledge_assets`：稳定 `knowledge_id`、最新版本、正式发布版本、变更代次及发布状态。
 - PostgreSQL `knowledge_revisions`：不可变版本的元数据、来源、证据、正文哈希、私有 OSS 引用，以及每版审核归属。
-- OSS：清洗后的完整 UTF-8 正文，以 SHA-256 内容寻址；同正文可复用对象。上传时明确设置 private，读取核对对象 ACL、长度和哈希。不返回对象地址或签名下载链接。
+- PostgreSQL `knowledge_roles`：SOP 声明的部门、岗位名称和稳定 role_id；资料归属与上传人岗位声明分开，旧条目保持未归属。
+- OSS：清洗后的完整 UTF-8 正文，以 SHA-256 内容寻址；同正文可复用对象。上传时明确设置 private，读取核对对象 ACL、长度和哈希。岗位资料的独立原件、HTML 预览和 Skill 安装包也存私有 OSS；普通检索/详情只返回安全文件描述，授权下载接口按当前正式版签发短期 URL。
 - OpenSearch：检索片段及向量；`knowledge_id + revision + chunk_id` 关联回完整资产。
 
 一项 Skill、案例或模板沿用稳定 ID；正文或元数据变更产生新 revision，发布前旧正式版本继续可读。来源包名和提供者自己的 KA 编号不能单独作为全局 ID。本阶段仍由维护者指定稳定 ID，不提供自动跨包实体合并。
 
-目录导入接收整理好的 MD/TXT 完整正文。另有下文的本地 ZIP 批量收件入口，支持文本、DOCX、XLSX、文本 PDF 解析及候选判定；图片 OCR、云端原始包归档、网页收件界面尚未实现，不把正文存储误称为全格式原件归档。
+CLI 目录导入接收整理好的 MD/TXT 完整正文。另有下文的本地 ZIP 批量收件入口，支持文本、DOCX、XLSX、文本 PDF 解析及候选判定；私有 OSS 原件收件与处理链见 [KNOWLEDGE_RECEIPTS.md](KNOWLEDGE_RECEIPTS.md)。独立岗位 SOP DOCX、岗位目录、Agent 绑定和文件预览下载见 [KNOWLEDGE_PROCESSING.md](KNOWLEDGE_PROCESSING.md)。图片 OCR 尚未实现，不把文字提取等同原版式还原。
 
 ## 服务器配置与建表
 
-在服务器配置 `KNOWLEDGE_DATABASE_URL`，仅支持 `postgresql://` 或 `postgres://`。连接凭证只放运行环境。数据库服务和数据库本身由服务器部署准备，本 CLI 只在指定数据库内初始化两张目录表。
+在服务器配置 `KNOWLEDGE_DATABASE_URL`，仅支持 `postgresql://` 或 `postgres://`。连接凭证只放运行环境。数据库服务和数据库本身由服务器部署准备，本 CLI 在指定数据库内初始化资产、版本和岗位目录表。已有部署需显式再次执行 init-db 增加 knowledge_roles；不会重写旧版本、发布指针或根据旧员工岗位猜测归属。
 
 ```dotenv
 KNOWLEDGE_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
@@ -38,6 +39,22 @@ python3 scripts/knowledge.py init-db --execute
 第一次仅预览，第二次才建表。已有记录不覆盖。API 启动与读取不自动创建 PostgreSQL 表；未初始化时维护写入拒绝执行，不能静默改用 SQLite。PostgreSQL 对同一资产的导入、发布、撤回使用事务级锁，并保留 generation 检查。
 
 未配置数据库 URL 时，本地目录由 `KNOWLEDGE_DATA_DIR` 指定，默认 `output/company_knowledge/knowledge.sqlite3`。本地默认正文 inline；可显式 `KNOWLEDGE_BODY_STORAGE=oss` 测试私有对象存储。原有本地数据库不会自动迁移到 PostgreSQL；若存在历史记录，迁移须保留 ID、版本、时间、审核记录、generation 和正式指针，不能逐条重新 import 冒充无损迁移。
+
+### 已有目录增加岗位表
+
+岗位改版复用上面的 `scripts/knowledge.py init-db --execute`，在现有目录中只补缺失的 `knowledge_roles` 表。PostgreSQL 在事务和既有 schema advisory lock 下执行 `CREATE TABLE IF NOT EXISTS`；SQLite 在写事务中执行同一建表语句。重复初始化不会重写 `knowledge_assets`、`knowledge_revisions`，不修改 `record_json`、正文/业务哈希、资产数量、latest_revision、published_revision、generation 或审核信息。初始化不调用 OSS、embedding 或 OpenSearch；旧向量不需要重建。处理服务的 init-db 通过 `GovernanceStore.initialize()` 复用这条目录初始化路径，治理旁路表可增加缺失的比较基线，不能据此改写正式版本。
+
+后续获准部署时按以下顺序操作；本段不是已部署回执：
+
+1. 在无并发发布/导入的维护窗口备份现有数据库，记录资产及版本数量、发布指针、哈希和旧表完整行摘要；确认运行环境仍指向原目录、原正文桶和原检索表。
+2. 使用具备目标 schema 建表权限的维护身份，先检查 init-db 的默认 dry-run，再执行一次 `scripts/knowledge.py init-db --execute`。仅为新增岗位表不需重新导入历史资料，也不需执行 index-draft 或 publish-batch。
+3. 比对两张旧表的完整行及上述基线，确认只有新岗位表为空；重复执行结果应相同。部署对应读取代码后，先核查历史目录、全文和未归属列表，再启用新增岗位资料的处理。若回退读取代码，保留新增表即可，不自动删表或回滚旧正式内容。
+
+历史记录没有 role_id 时继续归入“未归属”，不能用部门、上传人岗位或标题推测补写。历史详情缺少 `files` 时展示正文且下载列表为空；不能拿原收件 ZIP、来源路径或任意 OSS key 临时充当该资产的附件。未初始化岗位表时岗位列表为空，旧目录/全文仍可读取；新岗位写入须先完成显式初始化。
+
+新增附件仍使用现有私有正文桶，但独立位于 `company-knowledge/files/`。部署前须只读核验正文存储身份对该前缀的对象读写、对象 ACL 读取及私有 ACL 写入权限，并能读取桶版本状态（`oss:GetBucketVersioning`）；原正文前缀权限不会自动覆盖新文件前缀。当前文件写入拒绝已开启或已暂停版本控制的桶，避免禁止覆盖头失效；无权读取状态也不能跳过校验。该限制不要求更改旧正文或收件桶配置，具体权限与桶状态以目标环境核验为准。
+
+首份正式 SOP 可以建立岗位并走现有自动发布链；稳定 source-v2 资料更新继续使用现有 `基线修订`。再次上传有变化的裸 SOP DOCX 还没有保留原资产身份并显式带基线的换版入口，当前停留待处理并保留旧正式版。本次兼容修复不新增该入口，也不能把新文件的收件成功当作原 SOP 已换版。
 
 ## OpenSearch 独立表
 
@@ -147,6 +164,8 @@ curl 'http://127.0.0.1:8000/api/knowledge/decision-review?revision=1'
 
 department/scenario 是可选的精确标签筛选（去首尾空白，区分大小写），在检索前筛出正式版本，查询结束再次核对。缺字段的条目不会匹配指定标签；不传筛选字段时检索全部已发布知识。模型或索引故障不改查白酒产品表。
 
+新增可选 `role_id` 与 `category` 筛选。role_id 必须是岗位目录返回的 `role_` 加 24 位十六进制 ID，不能由员工岗位文字替代；category 为 `sop/skill/other`。这两个条件先进入目录的 published allowlist，再发送索引查询，避免全库 topK 挤掉本岗位结果。搜索、全文读回携带已登记的 role_id、department、role_name、category；文件描述不包含内部 object_ref。旧条目不因本次改版获得推测岗位。`unknown` 只在门户 catalog 中用于未归属列表，不作为语义检索岗位参数。
+
 接口参数边界：query 1–4000 字符，top_k 1–30 的整数，include_content 严格布尔值，筛选标签 1–200 字符；拒绝调用者传入表名或任意过滤表达式。不会静默截断完整正文，调用者应按正文长度选择 top_k，必要时使用轻量检索再逐项读取。
 
 ## 访问与规模边界
@@ -172,6 +191,12 @@ KNOWLEDGE_TEST_CLOUD=0 python3 -m pytest -q -m 'not integration'
 KNOWLEDGE_DATABASE_URL='' KNOWLEDGE_BODY_STORAGE=inline \
 KNOWLEDGE_TEST_CLOUD=0 python3 -m pytest -q tests/test_knowledge_postgres.py
 ```
+
+岗位增量回归覆盖升级前已有正式版、较新草稿与已撤回资料，逐行比较旧资产/版本表；实际调用 CLI dry-run、两次 execute 和治理初始化，并拦截任何正文对象或索引访问。SQLite 同时覆盖 inline 与 OSS 引用存储；PostgreSQL 复用随机隔离 schema，缺少显式测试数据库时跳过，不能将跳过写成真实 PostgreSQL 已通过。只运行这组检查可用 `PYTHON_DOTENV_DISABLED=1 python3 -m pytest -q tests/test_knowledge_store.py tests/test_knowledge_postgres.py -k role_initialization`。
+
+2026-10-14 已补真实本机 PostgreSQL 17.11 验证：使用本地 `postgres:17-alpine` 专用临时容器、仅绑定 127.0.0.1 的随机端口及 tmpfs 数据目录，没有挂载既有数据卷。岗位增量、目录并发/撤回、治理、处理事务及收件 PostgreSQL 四组用例共 **10 passed**；初次联测发现旧处理测试的表名集合未包含 knowledge_roles，补齐预期后全套通过。测试仅使用合成数据和临时 schema，结束时残留测试 schema 为零，临时容器及 Python 依赖目录均已清理。该结果证明本机 PostgreSQL 路径兼容，不代表生产迁移、真实 OSS/OpenSearch 联测或服务部署完成；原始输出保留于任务产物 `output/role-sop-compatibility-20261014/postgres-tests.log`。
+
+同日针对线上 PostgreSQL 16.15 的主版本补测：本机现成 `postgres:16` 镜像实际为 **16.14**，沿用上述隔离方式运行同一四组 PostgreSQL 用例，结果 **10 passed**。测试 schema、专用容器和临时依赖均已清理，17.11 结果保留。此项覆盖 PostgreSQL 16 主版本，不声称与线上 16.15 补丁版本或 Python 依赖版本完全一致；输出与清理记录为任务产物 `output/role-sop-compatibility-20261014/postgres16-tests.log`。
 
 完整链路另须有效的私有 OSS、embedding、OpenSearch 配置，并明确启用云测试。推送数据源必须与公司知识表匹配，例如（将 YOUR_INSTANCE_ID 替换为目标实例ID）：
 

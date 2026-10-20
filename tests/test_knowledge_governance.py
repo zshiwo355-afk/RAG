@@ -60,6 +60,52 @@ def test_same_source_reupload_preserves_payload_but_records_each_submission(syst
     assert second["record"]["sources"] == first["record"]["sources"]
 
 
+@pytest.mark.parametrize("same_source", [True, False])
+def test_collector_copy_of_published_legacy_content_is_duplicate_without_changing_source(system, same_source):
+    first = submit(system, 1)
+    publish(system, first)
+    before = system.catalogue.snapshot("source_a")
+    incoming = entry(evidence={**entry()["evidence"], "ingestion_source": "agent_collector"})
+    repeated = submit(system, 2, incoming, principal="user:a" if same_source else "user:b")
+    assert repeated["disposition"] == ("duplicate" if same_source else "duplicate_published")
+    assert repeated["duplicate_of_published"] and not repeated["publication_allowed"]
+    assert repeated["record"]["knowledge_id"] == "source_a" and repeated["record"]["revision"] == 1
+    assert system.catalogue.snapshot("source_a") == before
+    assert counts(system) == (1, 1, 2)
+
+
+def test_changed_source_cannot_switch_original_asset_into_collector_table_even_with_matching_base(system):
+    first = submit(system, 1)
+    publish(system, first)
+    before = system.catalogue.snapshot("source_a")
+    incoming = entry(content="新方法不能自动改写原资产的存储来源。",
+                     evidence={**entry()["evidence"], "ingestion_source": "agent_collector"})
+    with pytest.raises(ValueError, match="source_ingestion_source_conflict"):
+        submit(system, 2, incoming, base_revision=1)
+    assert system.catalogue.snapshot("source_a") == before
+    assert counts(system) == (1, 1, 1)
+
+
+def test_same_source_collector_revision_keeps_its_route_and_allows_normal_update(system):
+    evidence = {**entry()["evidence"], "ingestion_source": "agent_collector"}
+    first = submit(system, 1, entry(evidence=evidence))
+    publish(system, first)
+    second = submit(system, 2, entry(content="正常更新的采集资料。", evidence=evidence), base_revision=1)
+    assert second["publication_allowed"] and second["record"]["revision"] == 2
+    assert second["record"]["evidence"]["ingestion_source"] == "agent_collector"
+
+
+def test_collector_cannot_publish_matching_unpublished_legacy_draft(system):
+    first = submit(system, 1)
+    incoming = entry(evidence={**entry()["evidence"], "ingestion_source": "agent_collector"})
+    repeated = submit(system, 2, incoming, base_revision=1)
+    assert repeated["disposition"] == "duplicate" and repeated["record"]["revision"] == 1
+    assert repeated["reasons"] == ["source_ingestion_source_conflict"]
+    assert not repeated["duplicate_of_published"] and not repeated["publication_allowed"]
+    assert repeated["record"]["payload_hash"] == first["record"]["payload_hash"]
+    assert counts(system) == (1, 1, 2)
+
+
 def test_same_item_retry_pins_generation_and_conflicting_request_is_rejected(system):
     first = submit(system, 1)
     publish(system, first)

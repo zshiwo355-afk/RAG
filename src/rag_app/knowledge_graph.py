@@ -1,4 +1,4 @@
-"""Derived public-knowledge links; bounded process memory, no source writes."""
+"""Derived public-knowledge links; persistent features and bounded process memory."""
 from __future__ import annotations
 
 from collections import Counter, defaultdict, OrderedDict
@@ -21,6 +21,7 @@ MAX_EDGES = 2000
 MAX_BYTES = 2_800_000
 EXCERPT = 120
 RETRY_SECONDS = 60
+ALGORITHM_VERSION = "lexical-v1"
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 LINK = re.compile(r"(?<!!)\[([^\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)")
 WIKI = re.compile(r"\[\[([^\]\n]{1,240})\]\]")
@@ -103,6 +104,29 @@ def _features(record, content):
     lower = analyzed.lower()
     return {"terms": {term: counts[term] for term in retained}, "mentions": mentions,
             "snippets": {term: _excerpt(content, lower.find(term)) for term in retained if lower.find(term) >= 0}}
+
+
+def _cached_features(encoded):
+    """Ignore damaged/older cache payloads instead of failing the public graph."""
+    if not isinstance(encoded, str) or len(encoded) > 128_000:
+        return None
+    try:
+        value = json.loads(encoded)
+        terms, mentions, snippets = value["terms"], value["mentions"], value["snippets"]
+        if (set(value) != {"terms", "mentions", "snippets"} or not isinstance(terms, dict)
+                or not isinstance(mentions, list) or not isinstance(snippets, dict)
+                or len(terms) > MAX_TERMS or len(mentions) > MAX_MENTIONS
+                or not snippets.keys() <= terms.keys()
+                or any(not isinstance(term, str) or not 1 <= len(term) <= 40
+                       or type(count) is not int or not 0 < count <= 100_000 for term, count in terms.items())
+                or any(not isinstance(text, str) or len(text) > EXCERPT for text in snippets.values())
+                or any(not isinstance(item, list) or len(item) != 3 or item[0] not in {"wiki", "markdown"}
+                       or not isinstance(item[1], str) or len(item[1]) > 500
+                       or not isinstance(item[2], str) or len(item[2]) > EXCERPT for item in mentions)):
+            return None
+        return value
+    except (ValueError, TypeError, KeyError):
+        return None
 
 
 def _safe_path(value):
@@ -213,6 +237,45 @@ def _related(records, features):
     return result
 
 
+_warm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="knowledge-graph-publish")
+_warm_lock = threading.Lock()
+_warm_pending = set()
+MAX_WARM_JOBS = 8
+
+
+def _warm_publication(catalog, record, version, key):
+    try:
+        catalog.save_graph_features(record, version, _features(record, record["content"]))
+    except Exception:
+        # Cache failures must not turn a committed publication into a failure.
+        pass
+    finally:
+        with _warm_lock:
+            _warm_pending.discard(key)
+
+
+def cache_published_features(catalog, published):
+    """Best-effort postcommit warming, using the already verified publication body."""
+    if published.get("status") != "published" or not isinstance(published.get("content"), str):
+        return False
+    record = {name: published[name] for name in (
+        "knowledge_id", "revision", "content_hash", "published_at", "title", "content")}
+    key = (KnowledgeGraph._identity(catalog), ALGORITHM_VERSION, _key(record))
+    with _warm_lock:
+        # Bound retained bodies as well as worker count; overflow falls back to
+        # ordinary graph reads rather than delaying successful publication.
+        if key in _warm_pending or len(_warm_pending) >= MAX_WARM_JOBS:
+            return False
+        _warm_pending.add(key)
+    try:
+        _warm_executor.submit(_warm_publication, catalog, record, ALGORITHM_VERSION, key)
+    except Exception:
+        with _warm_lock:
+            _warm_pending.discard(key)
+        return False
+    return True
+
+
 class KnowledgeGraph:
     def __init__(self, *, executor=None, clock=time.monotonic, max_documents=MAX_DOCUMENTS):
         self.executor = executor or ThreadPoolExecutor(max_workers=4, thread_name_prefix="knowledge-graph")
@@ -221,6 +284,7 @@ class KnowledgeGraph:
         self.lock = threading.RLock()
         self.states = OrderedDict()
         self.pending_total = 0
+        self.algorithm_version = ALGORITHM_VERSION
 
     @staticmethod
     def _identity(catalog):
@@ -240,6 +304,12 @@ class KnowledgeGraph:
             if body is None or _key(body) != key:
                 raise ValueError("publication_changed")
             feature = _features(record, body["content"])
+            # Persistence is best effort; an unavailable cache never invalidates
+            # successfully computed features or changes the publication itself.
+            try:
+                reader.save_graph_features(record, self.algorithm_version, feature)
+            except Exception:
+                pass
         except Exception:
             with self.lock:
                 if state["expected"].get(record["knowledge_id"]) == key:
@@ -261,7 +331,8 @@ class KnowledgeGraph:
         identity = self._identity(catalog)
         with self.lock:
             state = self.states.setdefault(identity, {"expected": {}, "features": {}, "pending": set(), "failed": {},
-                                                       "edges_key": None, "edges": [], "edges_truncated": False})
+                                                       "edges_key": None, "edges": [], "edges_truncated": False,
+                                                       "disk_key": None})
             self.states.move_to_end(identity)
             while len(self.states) > 2:
                 _, evicted = self.states.popitem(last=False)
@@ -272,6 +343,19 @@ class KnowledgeGraph:
             keys = set(expected.values())
             state["features"] = {key: value for key, value in state["features"].items() if key in keys}
             state["failed"] = {key: value for key, value in state["failed"].items() if key in keys}
+            disk_key = (self.algorithm_version, frozenset(keys))
+            if state["disk_key"] != disk_key:
+                try:
+                    cached = catalog.graph_features(self.algorithm_version, limit=self.max_documents)
+                    for row in cached:
+                        key = _key(row)
+                        if key in keys and key not in state["features"]:
+                            feature = _cached_features(row["features_json"])
+                            if feature is not None:
+                                state["features"][key] = feature
+                    state["disk_key"] = disk_key
+                except Exception:
+                    pass
             for record in selected:
                 key = _key(record)
                 if (key not in state["features"] and key not in state["pending"]
@@ -288,7 +372,10 @@ class KnowledgeGraph:
                         state["failed"][key] = self.clock()
             features = {kid: state["features"][key] for kid, key in expected.items() if key in state["features"]}
             failed = set(state["failed"])
-            edges_key = (frozenset(keys), frozenset(expected[kid] for kid in features))
+            # Reference resolution also depends on titles, aliases and recorded
+            # relations, which may be corrected without changing the body.
+            metadata_key = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).digest()
+            edges_key = (metadata_key, frozenset(expected[kid] for kid in features))
             if state["edges_key"] != edges_key:
                 records = {record["knowledge_id"]: record for record in selected}
                 edges = _references(records, features)

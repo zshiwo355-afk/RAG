@@ -66,6 +66,21 @@ class Jobs:
             raise ProcessingError('processing_resolution_conflict', 409)
         return {'item_id': item_id, 'status': 'archived', 'version': 2, 'published': False}
 
+    def get_item_uploader_role(self, job_id, item_id):
+        self.calls.append(('item_role_get', job_id, item_id))
+        if job_id != JOB or item_id != ITEM:
+            raise ProcessingError('processing_item_not_found', 404)
+        return dict(original={'department': None, 'position': 'SSC'}, role=None,
+                    version=1, updated_at=None, requeued=False, confirmation_source=None,
+                    can_remember=False, remembered=False, rule_status='incomplete',
+                    remaining_reasons=['uploader_role_not_found'], eligible=True)
+
+    def set_item_uploader_role(self, job_id, item_id, **kwargs):
+        self.calls.append(('item_role_set', job_id, item_id, kwargs))
+        if kwargs['expected_version'] != 1:
+            raise ProcessingError('uploader_role_version_conflict', 409)
+        return dict(version=2, requeued=False, remaining_reasons=['unresolved_reference'])
+
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
@@ -90,6 +105,36 @@ def headers(*permissions, principal="alice"):
 
 
 BASE = "/api/rag/knowledge-processing"
+
+
+def test_item_role_requires_review_and_cannot_accept_client_identity_or_declaration(api):
+    client, jobs, _ = api
+    path = BASE + f'/jobs/{JOB}/items/{ITEM}/uploader-role'
+    body = dict(role_id='role_' + 'a' * 24, expected_version=1)
+    assert client.get(path).status_code == 401
+    for permission in (SELF, READ, DASH):
+        assert client.get(path, headers=headers(permission)).status_code == 403
+        assert client.post(path, headers=headers(permission), json=body).status_code == 403
+    assert not jobs.calls
+    response = client.get(path, headers=headers(REVIEW))
+    assert response.status_code == 200 and response.json()['original'] == {'department': None, 'position': 'SSC'}
+    assert response.headers['cache-control'] == 'no-store'
+    response = client.post(path, headers=headers(REVIEW, principal='reviewer'), json=body)
+    assert response.status_code == 200 and response.json()['requeued'] is False
+    assert jobs.calls[-1] == ('item_role_set', JOB, ITEM,
+        {**body, 'remember_rule': False, 'source_action': 'auto', 'actor': 'reviewer'})
+    for extra in ({'principal': 'someone'}, {'original': {'department': 'spoof'}}, {'actor': 'spoof'},
+                  {'expected_version': True}, {'expected_version': '1'}, {'expected_version': -1},
+                  {'remember_rule': 'true'}, {'remember_rule': 1}, {'source_action': 'update-all'}):
+        response = client.post(path, headers=headers(REVIEW), json={**body, **extra})
+        assert response.status_code == 422 and response.json()['detail'] == 'invalid_processing_request'
+    response = client.post(path, headers=headers(REVIEW), json={**body, 'expected_version': 2})
+    assert response.status_code == 409 and response.json()['detail'] == 'uploader_role_version_conflict'
+    response = client.post(path, headers=headers(REVIEW), json={**body, 'remember_rule': True, 'source_action': 'new'})
+    assert response.status_code == 200
+    assert jobs.calls[-1][-1]['source_action'] == 'new'
+    assert jobs.calls[-1][-1]['remember_rule'] is True
+    assert client.get(BASE + f'/jobs/{JOB}/items/{"0" * 32}/uploader-role', headers=headers(REVIEW)).status_code == 404
 
 
 def test_portal_semantic_search_reuses_published_search_and_checks_permissions(api, monkeypatch):
@@ -178,6 +223,22 @@ def test_review_permission_reads_company_jobs_and_audits_retry_actor(api):
     response = client.post(BASE + f"/jobs/{JOB}/retry", headers=headers(REVIEW, principal="reviewer"), json={})
     assert response.status_code == 200 and jobs.calls[-1] == ("retry", None, "reviewer")
     assert client.post(BASE + f"/jobs/{JOB}/retry", headers=headers(SELF), json={}).status_code == 403
+
+
+@pytest.mark.parametrize('status', ['attention', 'pending_publication'])
+def test_overview_filters_preserve_self_and_company_permissions(api, status):
+    client, jobs, _ = api
+    response = client.get(BASE + '/jobs', params={'status': status, 'limit': 1, 'offset': 2}, headers=headers(SELF))
+    assert response.status_code == 200
+    assert jobs.calls[-1] == ('list', 'alice', {'status': status, 'limit': 1, 'offset': 2})
+    for permission in (SELF, DASH):
+        assert client.get(BASE + '/jobs', params={'status': status, 'scope': 'company'}, headers=headers(permission)).status_code == 403
+    assert len(jobs.calls) == 1
+    response = client.get(BASE + '/jobs', params={'status': status, 'scope': 'company'}, headers=headers(REVIEW))
+    assert response.status_code == 200
+    assert jobs.calls[-1] == ('list', None, {'status': status, 'limit': 20, 'offset': 0})
+    assert response.json()['items'][0]['status'] == 'failed'
+    assert client.get(BASE + '/receipts', params={'status': status}, headers=headers(SELF)).status_code == 422
 
 
 def test_inputs_are_bounded_and_validation_errors_do_not_echo_secrets(api):
@@ -307,3 +368,60 @@ def test_graph_is_public_read_only_and_does_not_grant_private_processing_access(
     assert client.get(BASE + "/graph", headers={}).status_code == 401
     assert client.post(BASE + "/graph", headers=headers(REVIEW), json={}).status_code == 405
     assert not jobs.calls
+
+
+def test_item_role_api_real_store_preserves_declaration_and_other_pending_item(tmp_path, monkeypatch):
+    from rag_app.knowledge_native import TextSubmission, source_package
+    from test_knowledge_native import PAYLOAD
+    from test_knowledge_processing import system as system_fixture
+    from test_knowledge_processing_phase3 import enable, intake, receipt_job
+    from rag_app.knowledge_processing import UploadRoleMetadata
+
+    system = system_fixture.__wrapped__(tmp_path)
+    enable(system)
+    system.store.initialize_role_assignments(apply=True)
+    system.store.display_metadata = UploadRoleMetadata(read=system.service.artifacts.get)
+    monkeypatch.setenv('KNOWLEDGE_RECEIPTS_ENABLED', '1')
+    monkeypatch.setenv('KNOWLEDGE_PROCESSING_ENABLED', '1')
+    monkeypatch.setenv('KNOWLEDGE_RECEIPTS_TOKEN', TOKEN)
+    role = system.catalogue.register_role('共享中心', '流程专员')
+    role_data = source_package(TextSubmission(**{**PAYLOAD, 'department': '共享中心', 'position': 'SSC'}))
+    missing_data = source_package(TextSubmission(**{**PAYLOAD, 'source_id': 'other-source', 'position': '设计岗',
+        'content': PAYLOAD['content'] + '\n运行 `scripts/missing.py` 完成交付。'}))
+    first = intake(system, role_data, principal='shared-account', source='role-only')
+    assert system.service.run_once()
+    second = intake(system, missing_data, principal='shared-account', source='missing-script')
+    assert system.service.run_once()
+    first_job, untouched = receipt_job(system, first), receipt_job(system, second)
+    item = next(i for i in first_job['items'] if i['status'] == 'needs_review')
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_processing_store] = lambda: system.store
+    app.dependency_overrides[get_catalog] = lambda: system.catalogue
+    path = BASE + f"/jobs/{first_job['job_id']}/items/{item['item_id']}/uploader-role"
+    try:
+        with TestClient(app) as client:
+            missing = client.get(BASE + f"/jobs/{untouched['job_id']}",
+                                 headers=headers(SELF, principal='shared-account'))
+            assert missing.status_code == 200
+            pending = next(i for i in missing.json()['items'] if i['status'] == 'needs_review')
+            assert pending['missing_references'] == ['scripts/missing.py']
+            assert 'repair_json' not in missing.text
+            before = client.get(path, headers=headers(REVIEW)).json()
+            assert before['original'] == {'department': '共享中心', 'position': 'SSC'}
+            saved = client.post(path, headers=headers(REVIEW), json=dict(role_id=role['role_id'],
+                expected_version=before['version'], remember_rule=True))
+            assert saved.status_code == 200, saved.text
+            assert saved.json()['requeued'] is True
+            assert saved.json()['role']['role_id'] == role['role_id']
+            assert saved.json()['remembered'] is True
+            assert system.service.run_once()
+            completed = receipt_job(system, first)
+            published = next(i for i in completed['items'] if i['published'])
+            record = system.catalogue.get_published(published['knowledge_id'])
+            assert record['role_id'] == role['role_id']
+            assert record['evidence']['source_uploader_position'] == 'SSC'
+            assert record['evidence']['source_uploader_department'] == '共享中心'
+            assert receipt_job(system, second) == untouched
+    finally:
+        system.store.display_metadata.executor.shutdown(wait=True)

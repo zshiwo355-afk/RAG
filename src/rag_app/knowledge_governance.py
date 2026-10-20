@@ -24,8 +24,10 @@ _VOLATILE_EVIDENCE = {
     "source_base_revision", "source_revision_label", "base_revision", "submission_id", "submitted_at",
     "submitter_authenticated", "automatic_rule_reasons", "auto_publish",
     "governance_attachment_hash", "governance_fingerprint_version", "governance_receipt_id",
-    "source_uploader_position", "uploader_attribution",
+    "source_uploader_position", "source_uploader_department", "uploader_attribution",
     "uploader_position", "uploader_position_source",
+    "uploader_role_confirmation",
+    "ingestion_source",
 }
 _UNKNOWN_ATTACHMENTS = {
     "script_dependency_not_provided", "referenced_material_unparsed", "unresolved_reference",
@@ -94,15 +96,22 @@ def fingerprint_entry(record, asset=None):
     Missing attachment evidence is different from a verified empty manifest.
     Existing catalogue hashes can be indexed without downloading OSS bodies.
     """
+    return fingerprint_record(record, _attachment_hash(asset))
+
+
+def fingerprint_record(record, attachment_hash):
+    """Compare metadata while retaining an already verified attachment digest."""
+    if attachment_hash is not None and (not isinstance(attachment_hash, str) or not _HASH.fullmatch(attachment_hash)):
+        raise ValueError("invalid verified attachment hash")
     content_hash = record.get("content_hash")
     if not isinstance(content_hash, str) or not _HASH.fullmatch(content_hash):
         raise ValueError("record requires a verified content_hash")
     metadata = {key: record[key] for key in (
         "title", "kind", "contributor", "department", "scenarios", "chunking_version",
+        "role_id", "role_name", "category", "files",
     ) if key in record}
     metadata["evidence"] = {key: value for key, value in record.get("evidence", {}).items()
                             if key not in _VOLATILE_EVIDENCE}
-    attachment_hash = _attachment_hash(asset)
     return {"fingerprint_version": FINGERPRINT_VERSION, "content_hash": content_hash,
             "attachment_hash": attachment_hash, "title_key": _title_key(record["title"]),
             "comparison_hash": _digest({"version": FINGERPRINT_VERSION, "content": content_hash,
@@ -152,6 +161,7 @@ class GovernanceStore:
             raise AutomaticPublicationConflict("publication_fingerprint_unavailable")
         if candidate["attachment_hash"] is None:
             raise AutomaticPublicationConflict("attachment_manifest_unverified")
+        candidate_role = self.catalog._record(connection, knowledge_id, revision, hydrate=False).get("role_id")
         public = self._execute(connection, """SELECT a.knowledge_id,r.record_json,
             f.comparison_hash,f.content_hash,f.attachment_hash,f.title_key
             FROM knowledge_assets a JOIN knowledge_revisions r
@@ -163,6 +173,8 @@ class GovernanceStore:
             (knowledge_id, candidate["content_hash"], candidate["title_key"])).fetchall()
         conflict = False
         for row in public:
+            if candidate_role and json.loads(row["record_json"]).get("role_id") != candidate_role:
+                continue
             # A legacy writer may publish after the last baseline. Compare its
             # stored metadata without OSS reads or changing the sidecar here.
             other = dict(row) if row["comparison_hash"] is not None else fingerprint_entry(json.loads(row["record_json"]))
@@ -208,7 +220,7 @@ class GovernanceStore:
             self._identity(value, name)
         if base_revision is not None and (type(base_revision) is not int or not 1 <= base_revision <= 2**63 - 1):
             raise ValueError("base_revision must be a positive int64")
-        payload = normalize_entry(entry)
+        payload = normalize_entry(self.catalog.bind_role(normalize_entry(entry), create_from_sop=True))
         fingerprint = fingerprint_entry(payload, asset)
         source_key = _digest([principal, source_id, source_identity])
         request_hash = _digest([receipt_id, principal, source_id, source_identity,
@@ -240,12 +252,24 @@ class GovernanceStore:
                 owned_id = "kg_" + source_key[:48]
                 if self._execute(connection, "SELECT 1 FROM knowledge_assets WHERE knowledge_id=?", (owned_id,)).fetchone():
                     raise ValueError("source_identity_conflict")
+            # The request hash describes submitted bytes. Role assignment is a
+            # server decision; durable submissions above never resolve it again.
+            self.catalog._lock(connection, owned_id)
+            owned = self._execute(connection, "SELECT latest_revision FROM knowledge_assets WHERE knowledge_id=?", (owned_id,)).fetchone()
+            previous_record = self.catalog._record(connection, owned_id, owned["latest_revision"], hydrate=False) if owned and history else None
+            payload = normalize_entry(self.catalog.bind_uploader_role(connection, payload, previous_record, principal=principal))
+            fingerprint = fingerprint_entry(payload, asset)
             self._baseline(connection)
             # Only current published pointers participate in cross-source lookup.
             published = self._execute(connection, """SELECT f.*,a.generation FROM knowledge_revision_fingerprints f
                 JOIN knowledge_assets a ON a.knowledge_id=f.knowledge_id AND a.published_revision=f.revision
                 WHERE f.content_hash=? OR f.title_key=? ORDER BY f.knowledge_id""",
                 (fingerprint["content_hash"], fingerprint["title_key"])).fetchall()
+            if payload.get("role_id"):
+                # Identical text used by another role is a separate membership,
+                # never silently adopted through global deduplication.
+                published = [row for row in published if self.catalog._record(
+                    connection, row["knowledge_id"], row["revision"], hydrate=False).get("role_id") == payload["role_id"]]
             own_versions = [row for row in history if row["knowledge_id"] == owned_id]
             matching = next((row for row in reversed(own_versions)
                              if fingerprint["attachment_hash"] is not None
@@ -265,7 +289,8 @@ class GovernanceStore:
                 reasons = ["older_source_revision"] if old else json.loads(matching["reasons_json"])
                 revision, generation = matching["revision"], matching["expected_generation"]
                 allowed = not old and bool(matching["publication_allowed"])
-                status = self.catalog._record(connection, owned_id, revision, hydrate=False)["status"]
+                matching_record = self.catalog._record(connection, owned_id, revision, hydrate=False)
+                status = matching_record["status"]
                 if (not old and base_revision == current["latest_revision"]
                         and status == "draft"
                         and set(reasons) & {"source_base_revision_required", "source_base_revision_conflict"}):
@@ -284,6 +309,10 @@ class GovernanceStore:
                     duplicate, allowed = True, False
                 elif not old and status == "withdrawn":
                     reasons.append("previously_withdrawn_revision")
+                    allowed = False
+                elif not old and (matching_record.get("evidence", {}).get("ingestion_source", "legacy")
+                                  != payload["evidence"].get("ingestion_source", "legacy")):
+                    reasons.append("source_ingestion_source_conflict")
                     allowed = False
             elif public_match is not None:
                 current = self.catalog._asset(connection, target_id)

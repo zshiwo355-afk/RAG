@@ -11,6 +11,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, field_validator
 
 from .knowledge_receipts import IDENTIFIER, MAX_BYTES, ReceiptError, ReceiptService, validate_payload, validate_principal
+from .knowledge_native import TextSubmission, submit_text, submission_status
 
 
 class ReceiptRoute(APIRoute):
@@ -27,7 +28,7 @@ class ReceiptRoute(APIRoute):
         return safe_validation
 
 
-router = APIRouter(prefix="/api/knowledge-intake/uploads", tags=["knowledge-intake"], route_class=ReceiptRoute)
+router = APIRouter(prefix="/api/knowledge-intake", tags=["knowledge-intake"], route_class=ReceiptRoute)
 
 
 class UploadRequest(BaseModel):
@@ -85,19 +86,25 @@ def _call(method, *args):
         raise HTTPException(status_code=503, detail="receipts_unavailable") from None
 
 
-@router.post("")
+@router.post("/text", status_code=202)
+def submit_content(request: TextSubmission, principal: str = Depends(authenticated_principal),
+                   service: ReceiptService = Depends(get_receipt_service)):
+    return _call(submit_text, service, principal, request)
+
+
+@router.post("/uploads")
 def prepare_upload(request: UploadRequest, principal: str = Depends(authenticated_principal),
                    service: ReceiptService = Depends(get_receipt_service)):
     return _call(service.prepare, principal, request.model_dump())
 
 
-@router.post("/{receipt_id}/complete")
+@router.post("/uploads/{receipt_id}/complete")
 def complete_upload(receipt_id: str, request: CompleteRequest, principal: str = Depends(authenticated_principal),
                     service: ReceiptService = Depends(get_receipt_service)):
     return _call(service.complete, principal, receipt_id)
 
 
-@router.get("/{receipt_id}")
+@router.get("/uploads/{receipt_id}")
 def upload_status(receipt_id: str, principal: str = Depends(authenticated_principal),
                   service: ReceiptService = Depends(get_receipt_service)):
-    return _call(service.status, principal, receipt_id)
+    return _call(submission_status, service, principal, receipt_id)

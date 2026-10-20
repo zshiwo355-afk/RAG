@@ -96,7 +96,7 @@ def test_verified_markdown_becomes_persistent_unapproved_draft(system):
     assert system.receipts.get('user:a', receipt['receipt_id'])['status'] == 'verified'
     assert not system.service.run_once()
     assert max(system.bucket.read_sizes) <= 65536
-    assert system.store.stats('user:a') == dict(receipts=1, receipt_counts=dict(total=1, awaiting_upload=0, pending_verification=0, verified=1, rejected=0, failed=0), queued=0, running=0, completed=1,
+    assert system.store.stats('user:a') == dict(receipts=1, attention_jobs=0, receipt_counts=dict(total=1, awaiting_upload=0, pending_verification=0, verified=1, rejected=0, failed=0), queued=0, running=0, completed=1,
                                                needs_review=0, failed=0, draft_items=1, review_items=0, archived_items=0,
                                                duplicate_items=0, outdated_items=0, indexing_items=0, published_items=0)
     with system.store._connection() as connection:
@@ -173,6 +173,50 @@ def test_enqueuing_and_claims_are_atomic_and_owner_scoped(system):
         system.store.get_job(result['job_id'], 'user:b')
 
 
+def test_overview_job_filters_match_counts_without_duplicate_jobs_or_owner_leaks(system):
+    fixtures = [
+        ('draft', 'user:a', 'completed', 'draft'),
+        ('indexing', 'user:a', 'running', 'indexing'),
+        ('review', 'user:a', 'needs_review', 'needs_review'),
+        ('failed', 'user:a', 'failed', 'archived'),
+        ('published', 'user:a', 'completed', 'published'),
+        ('foreign', 'user:b', 'failed', 'draft'),
+    ]
+    ids = {}
+    for label, principal, job_status, item_status in fixtures:
+        system.now[0] += 1
+        data = zip_bytes({'a.md': BODY + label, 'b.md': BODY + label + ' second'}) if label == 'draft' else BODY + label
+        receipt = submit(system, data, filename='bundle.zip' if label == 'draft' else 'method.md',
+                         principal=principal, source_id='filter:' + label)
+        assert system.service.run_once()
+        with system.store._connection(write=True) as connection:
+            job_id = connection.execute('SELECT job_id FROM knowledge_processing_jobs WHERE receipt_id=?', (receipt['receipt_id'],)).fetchone()['job_id']
+            connection.execute('UPDATE knowledge_processing_jobs SET status=? WHERE job_id=?', (job_status, job_id))
+            connection.execute('UPDATE knowledge_processing_items SET status=? WHERE job_id=?', (item_status, job_id))
+        ids[label] = job_id
+
+    attention = system.store.list_jobs('user:a', status='attention')
+    assert attention['total'] == 2
+    assert {item['job_id'] for item in attention['items']} == {ids['review'], ids['failed']}
+    stats = system.store.stats('user:a')
+    assert attention['total'] == stats['needs_review'] + stats['failed']
+    assert system.store.list_jobs(None, status='attention')['total'] == 3
+    assert system.store.list_jobs('user:a', status='failed')['total'] == 1
+
+    pending = system.store.list_jobs('user:a', status='pending_publication')
+    assert pending['total'] == 2  # Two draft items in one job still produce one task row.
+    assert {item['job_id'] for item in pending['items']} == {ids['draft'], ids['indexing']}
+    assert stats['draft_items'] + stats['indexing_items'] == 3
+    assert system.store.list_jobs(None, status='pending_publication')['total'] == 3
+    pages = [system.store.list_jobs('user:a', status='pending_publication', limit=1, offset=offset) for offset in (0, 1, 2)]
+    assert all(page['total'] == 2 for page in pages)
+    assert {item['job_id'] for page in pages for item in page['items']} == {ids['draft'], ids['indexing']}
+    assert pages[2]['items'] == []
+    assert system.store.list_jobs('user:c', status='pending_publication') == {'items': [], 'total': 0}
+    with pytest.raises(ProcessingError, match='invalid_processing_query'):
+        system.store.list_jobs('user:a', status='attention,completed')
+
+
 def test_expired_worker_cannot_insert_draft_or_finish(system):
     submit(system)
     system.store.enqueue_verified()
@@ -242,7 +286,7 @@ def test_principal_namespace_and_same_source_modified_do_not_overwrite(system):
     submit(system, BODY + '\n修改内容。')
     system.service.run_once()
     assert len(system.catalogue.list_assets()) == 2
-    assert system.catalogue.snapshot(first['knowledge_id'])['revision'] == 2
+    assert system.catalogue.snapshot(first['knowledge_id'])['revision'] == 1
     assert system.catalogue.snapshot(first['knowledge_id'], 1)['content'] == BODY
     results = system.store.list_jobs('user:a')['items']
     assert {item['status'] for item in results} == {'completed', 'needs_review'}

@@ -10,15 +10,25 @@ from typing import Any, Optional
 from . import knowledge_relevance, rerank_service
 from .config import load_env
 from .knowledge_index import KnowledgeIndex, chunk_document
-from .knowledge_store import AutomaticPublicationConflict, KnowledgeStore, normalize_entry
+from .knowledge_store import AutomaticPublicationConflict, KnowledgeStore, knowledge_category, normalize_entry, validate_role_id
 
 
 PUBLIC_FIELDS = (
     "knowledge_id", "revision", "title", "content", "contributor", "kind",
     "sources", "evidence", "content_hash", "payload_hash", "created_at",
     "published_at", "confirmed_by", "status", "department", "scenarios", "chunking_version",
+    "role_id", "role_name", "category", "files",
 )
 logger = logging.getLogger(__name__)
+
+
+def _warm_graph(store, published):
+    # Publication is already committed; a derived cache must never change its result.
+    try:
+        from .knowledge_graph import cache_published_features
+        cache_published_features(store, published)
+    except Exception:
+        logger.warning("Knowledge graph cache warmup unavailable")
 
 
 def public_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -27,6 +37,10 @@ def public_record(record: dict[str, Any]) -> dict[str, Any]:
     if "evidence" in result:
         result["evidence"] = {key: value for key, value in result["evidence"].items()
                               if key not in {"uploader_position", "uploader_position_source"}}
+    result["category"] = knowledge_category(record)
+    if "files" in result:
+        from .knowledge_files import public_file_descriptor
+        result["files"] = [public_file_descriptor(item) for item in result["files"]]
     return result
 
 
@@ -97,6 +111,7 @@ class KnowledgeService:
             knowledge_id, snapshot["revision"], expected_generation=snapshot["generation"],
             confirmed_by=confirmed_by.strip(),
         )
+        _warm_graph(self.store, published)
         return {"status": "published", "knowledge": public_record(published), "verification": verification}
 
     def publish_automatic(
@@ -130,6 +145,7 @@ class KnowledgeService:
             transaction_complete=(lambda connection, record: transaction_complete(connection, record, verification))
             if transaction_complete is not None else None,
         )
+        _warm_graph(self.store, published)
         return {"status": "published", "knowledge": public_record(published), "verification": verification}
 
     def withdraw(self, knowledge_id: str, execute: bool = False) -> dict[str, Any]:
@@ -167,6 +183,7 @@ class KnowledgeService:
     def search(
         self, query: str, top_k: int = 10, *, include_content: bool = True,
         department: Optional[str] = None, scenario: Optional[str] = None,
+        role_id: Optional[str] = None, category: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(query, str) or not query.strip() or len(query) > 4000:
             raise ValueError("query 必须为 1–4000 字符的非空文本")
@@ -175,6 +192,12 @@ class KnowledgeService:
         if type(include_content) is not bool:
             raise ValueError("include_content 必须为布尔值")
         filters = {"department": department, "scenario": scenario}
+        if role_id is not None:
+            filters["role_id"] = validate_role_id(role_id)
+        if category is not None:
+            if category not in {"sop", "skill", "other"}:
+                raise ValueError("invalid_knowledge_category")
+            filters["category"] = category
         for name, value in filters.items():
             if value is not None:
                 if not isinstance(value, str) or not value.strip() or len(value) > 200:

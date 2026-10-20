@@ -29,6 +29,9 @@ SOURCE_GOVERNANCE_COLUMNS = {"基线修订": "source_base_revision", "共享范�
                              "使用对象": "source_audience", "输入": "source_inputs", "输出": "source_outputs",
                              "依赖与权限": "source_dependencies", "适用边界": "source_boundaries"}
 SOURCE_UPLOADER_COLUMN = "上传员工岗位"
+SOURCE_UPLOADER_DEPARTMENT_COLUMN = "上传员工部门"
+SOURCE_ROLE_COLUMNS = ("role_id", "department", "role_name")
+SOURCE_SKILL_COLUMN = "skill_package_path"
 SOURCE_REVISION_LABEL = re.compile(r"[1-9][0-9]{3}-(?:0[1-9]|1[0-2])")
 SOURCE_TYPES = {"方法": "method", "流程": "process", "模板": "template", "提示词": "prompt",
                 "Skill方法": "method", "案例": "case", "规则": "policy", "参考": "reference"}
@@ -225,7 +228,7 @@ def scan_package(source, cache):
                             columns = tuple(rows[0]) if rows else ()
                             if (columns[:len(SOURCE_COLUMNS)] != SOURCE_COLUMNS
                                     or len(columns) != len(set(columns))
-                                    or not set(columns[len(SOURCE_COLUMNS):]).issubset({*SOURCE_GOVERNANCE_COLUMNS, SOURCE_UPLOADER_COLUMN})
+                                    or not set(columns[len(SOURCE_COLUMNS):]).issubset({*SOURCE_GOVERNANCE_COLUMNS, SOURCE_UPLOADER_COLUMN, SOURCE_UPLOADER_DEPARTMENT_COLUMN, *SOURCE_ROLE_COLUMNS, SOURCE_SKILL_COLUMN})
                                     or any(len(row) != len(columns) for row in rows[1:])):
                                 raise ValueError("source_manifest_invalid")
                             documents[name]["csv_rows"] = [dict(zip(columns, (clean_text(cell)[0].strip() for cell in row))) for row in rows[1:]]
@@ -283,7 +286,19 @@ def _source_manifest(report, documents):
             position = row.get(SOURCE_UPLOADER_COLUMN, "")
             if len(position) > 200 or re.search(r"[\x00-\x1f\x7f]", position):
                 raise ValueError("source_manifest_invalid_uploader_position")
+            department = row.get(SOURCE_UPLOADER_DEPARTMENT_COLUMN, "")
+            if len(department) > 200 or re.search(r"[\x00-\x1f\x7f]", department):
+                raise ValueError("source_manifest_invalid_uploader_department")
+            if (any(len(row.get(field, "")) > 200 or re.search(r"[\x00-\x1f\x7f]", row.get(field, "")) for field in SOURCE_ROLE_COLUMNS)
+                    or row.get("role_id") and not re.fullmatch(r"role_[0-9a-f]{24}", row["role_id"])):
+                raise ValueError("source_manifest_invalid_role")
             if state == "交付":
+                skill_path = row.get(SOURCE_SKILL_COLUMN, "")
+                if skill_path and (row["类型"] != "Skill方法" or skill_path.startswith(("/", "~"))
+                        or "\\" in skill_path or ":" in skill_path or "\x00" in skill_path
+                        or any(part in {"", ".", ".."} for part in skill_path.split("/"))
+                        or PurePosixPath(skill_path).suffix.lower() != ".zip"):
+                    raise ValueError("source_manifest_unsafe_skill_package")
                 path = row["正文路径"].replace("\\", "/")
                 if (not path or path.startswith(("/", "~")) or ":" in path or "\x00" in path
                         or any(part in {"", ".", ".."} for part in path.split("/"))
@@ -336,6 +351,18 @@ def _title(text, fallback):
     lines = text.splitlines()
     heading = next((line.lstrip("# ") for line in lines if re.match(r"^#{1,6}\s+", line)), None)
     return (heading or fallback)[:240]
+
+
+def _sop_title(metadata, text, fallback):
+    if metadata.get("document_name"):
+        return metadata["document_name"][:240]
+    if metadata.get("department") and metadata.get("role_name"):
+        return f"{metadata['department']} {metadata['role_name']} 岗位SOP"[:240]
+    # A Word title can be plain text. Never promote an arbitrary first section.
+    title = next((line.lstrip("# ").strip() for line in text.splitlines()[:8]
+                  if re.search(r"岗位.*(?:SOP|标准作业|操作流程)|SOP.*岗位", line, re.I)
+                  and not re.match(r"^\s*#{1,6}\s*\d", line)), None)
+    return (title or fallback)[:240]
 
 
 def _reference_collection(name, text):
@@ -503,10 +530,14 @@ def _prepare_assets(source, report, documents):
             continue
         members, issues, related = [name], list(doc["issues"]), set(collections.get(name, ()))
         available = {file["name"] for file in report["files"]}
+        skill_path = (posixpath.join(posixpath.dirname(manifest[0]), delivered[name][SOURCE_SKILL_COLUMN])
+                      if delivered is not None and delivered[name].get(SOURCE_SKILL_COLUMN) else None)
+        if skill_path and skill_path not in available:
+            issues.append({"code": "skill_package_missing"})
         attachment_root = attachment_roots.get(name)
         if attachment_root:
             for file in report["files"]:
-                if file["name"].startswith(attachment_root) and file["name"] not in documents:
+                if file["name"].startswith(attachment_root) and file["name"] not in documents and file["name"] != skill_path:
                     code = "script_dependency_not_provided" if PurePosixPath(file["name"]).suffix.lower() in SCRIPT_EXTENSIONS else "referenced_material_unparsed"
                     issues.append({"code": code, "reference": file["name"]})
         # A real Skill directory owns its textual references/templates. Sibling
@@ -531,6 +562,8 @@ def _prepare_assets(source, report, documents):
                     # Directory mentions are not claims about any one missing file.
                     continue
                 resolved = _resolve_reference(member, reference, available)
+                if resolved == skill_path and skill_path is not None:
+                    continue
                 if resolved is None and attachment_root:
                     candidate = posixpath.normpath(posixpath.join(attachment_root, unquote(reference).replace("\\", "/")))
                     if candidate.startswith(attachment_root) and candidate in available:
@@ -590,8 +623,24 @@ def _prepare_assets(source, report, documents):
                 metadata["evidence"]["source_revision_label"] = metadata["evidence"].pop("source_base_revision")
             if row.get(SOURCE_UPLOADER_COLUMN):
                 metadata["evidence"]["source_uploader_position"] = row[SOURCE_UPLOADER_COLUMN]
+            if row.get(SOURCE_UPLOADER_DEPARTMENT_COLUMN):
+                metadata["evidence"]["source_uploader_department"] = row[SOURCE_UPLOADER_DEPARTMENT_COLUMN]
             if row["类型"] == "Skill方法":
                 metadata["evidence"]["delivery_scope"] = "method_reference_only"
+            metadata.update({field: row[field] for field in SOURCE_ROLE_COLUMNS if row.get(field)})
+        sop = doc.get("sop_metadata")
+        if sop:
+            for field in ("department", "role_name"):
+                if metadata.get(field) and metadata[field] != sop[field]:
+                    issues.append({"code": "role_metadata_mismatch"})
+                else:
+                    metadata[field] = sop[field]
+            if delivered is None:
+                metadata.update(kind="process", category="sop", title=_sop_title(sop, doc["text"], PurePosixPath(name).stem))
+                metadata["evidence"].update(source_protocol="company-role-sop-v1", source_type="流程",
+                                            source_sharing="全员", role_source="sop_document")
+            elif metadata["kind"] != "process":
+                issues.append({"code": "sop_category_mismatch"})
         asset = {"knowledge_id": asset_id, "metadata": metadata, "content": body,
                        "source_id": source["source_id"], "source_path": name,
                        "source_package": source["package"], "source_sha256": doc["sha256"],
@@ -599,6 +648,8 @@ def _prepare_assets(source, report, documents):
                        "related_knowledge_ids": [asset_identity(path) for path in sorted(related)],
                        "decision": "review_required", "published": False,
                        "context_hash": sha(json.dumps([(_relative(m["source_path"]), m["source_sha256"]) for m in locations], ensure_ascii=False))}
+        if delivered is not None and row.get(SOURCE_SKILL_COLUMN):
+            asset["skill_package_path"] = posixpath.join(posixpath.dirname(manifest[0]), row[SOURCE_SKILL_COLUMN])
         if delivered is not None:
             asset["context_hash"] = sha(asset["context_hash"] + json.dumps(row, sort_keys=True, ensure_ascii=False))
         if any(key in collections for key in owned.get(name, ())):

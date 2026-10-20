@@ -1,6 +1,9 @@
 import io
 import json
 import zipfile
+from xml.etree import ElementTree as ET
+from html import escape
+from html.parser import HTMLParser
 
 import pytest
 
@@ -88,6 +91,153 @@ def test_docx_keeps_paragraph_table_order_and_discloses_omissions():
     assert 'private' not in json.dumps(result['issues'])
 
 
+def paragraph(text, style=None):
+    return '<w:p>' + ('<w:pPr><w:pStyle w:val="%s"/></w:pPr>' % style if style else '') + '<w:r><w:t>' + escape(text) + '</w:t></w:r></w:p>'
+
+
+def table(rows):
+    return '<w:tbl>' + ''.join('<w:tr>' + ''.join('<w:tc>' + paragraph(cell) + '</w:tc>' for cell in row) + '</w:tr>' for row in rows) + '</w:tbl>'
+
+
+@pytest.mark.parametrize('part', ['footnotes', 'endnotes', 'comments'])
+def test_docx_empty_auxiliary_parts_do_not_report_missing_content(part):
+    children = ''
+    if part != 'comments':
+        children = ''.join(
+            '<w:%s w:type="%s" w:id="%s"><w:p><w:pPr><w:spacing w:line="240" w:lineRule="auto"/></w:pPr>'
+            '<w:r><w:%s/></w:r></w:p></w:%s>' % (part[:-1], kind, index, kind, part[:-1])
+            for index, kind in enumerate(('separator', 'continuationSeparator')))
+    auxiliary = '<w:%s xmlns:w="%s">%s</w:%s>' % (part, kt.W[1:-1], children, part)
+    raw = docx(paragraph('岗位SOP') + table([['所属部门', '电商部', '岗位名称', '电商负责人']]),
+               **{'word/' + part + '.xml': auxiliary})
+    result = kt.parse_text_file('岗位SOP.docx', raw)
+    assert result['issues'] == []
+    assert result['sop_metadata'] == {'department': '电商部', 'role_name': '电商负责人'}
+    assert 'docx_auxiliary_parts_not_parsed' not in kt.docx_html_preview(raw).decode()
+
+
+@pytest.mark.parametrize('part,children', [
+    ('footnotes', '<w:footnote w:id="2">' + paragraph('审批必须由负责人确认') + '</w:footnote>'),
+    ('endnotes', '<w:endnote w:id="2">' + paragraph('实际尾注') + '</w:endnote>'),
+    ('comments', '<w:comment w:id="0">' + paragraph('实际批注') + '</w:comment>'),
+    ('comments', '<w:comment w:id="0"/>'),
+    ('footnotes', '<w:footnote w:type="separator" w:id="0"><w:p><w:r><w:separator/><w:t>真实说明</w:t></w:r></w:p></w:footnote>'),
+    ('footnotes', '<w:footnote w:type="separator" w:id="0"><w:p><w:r><w:separator/><w:drawing/></w:r></w:p></w:footnote>'),
+    ('endnotes', '<w:endnote w:type="separator" w:id="0"><w:p><w:r><w:separator/><w:object/></w:r></w:p></w:endnote>'),
+    ('footnotes', '<w:footnote w:type="separator" w:id="0"><w:p><w:r><w:separator/><w:unknown/></w:r></w:p></w:footnote>'),
+    ('footnotes', '<w:footnote w:type="separator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>'),
+    ('footnotes', '<w:footnote w:type="separator" w:id="0"><w:p><w:r/></w:p></w:footnote>'),
+    ('footnotes', '<w:footnote w:type="separator" w:id="0"><w:p><w:r><w:separator unknown="value"/></w:r></w:p></w:footnote>'),
+    ('footnotes', '<w:footnote w:type="separator" w:id="0"><w:p><w:pPr><w:unknown/></w:pPr><w:r><w:separator/></w:r></w:p></w:footnote>'),
+    ('footnotes', '<w:footnote w:type="separator"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>'),
+    ('footnotes', '<w:footnote w:id="2"><w:p/></w:footnote>'),
+    ('comments', '<w:unknown/>'),
+])
+def test_docx_real_or_unknown_auxiliary_content_still_requires_review(part, children):
+    auxiliary = '<w:%s xmlns:w="%s">%s</w:%s>' % (part, kt.W[1:-1], children, part)
+    raw = docx(paragraph('正文'), **{'word/' + part + '.xml': auxiliary})
+    assert 'docx_auxiliary_parts_not_parsed' in codes(kt.parse_text_file('test.docx', raw))
+    assert 'docx_auxiliary_parts_not_parsed' in kt.docx_html_preview(raw).decode()
+
+
+def test_docx_auxiliary_root_is_validated_before_ignoring_empty_parts():
+    for auxiliary in ('<unknown/>', '<w:comments xmlns:w="%s" unknown="value"/>' % kt.W[1:-1]):
+        raw = docx(paragraph('正文'), **{'word/comments.xml': auxiliary})
+        assert 'docx_auxiliary_parts_not_parsed' in codes(kt.parse_text_file('test.docx', raw))
+
+
+@pytest.mark.parametrize('extra,expected', [
+    ([], {'department': '总经办', 'role_name': 'AI架构师'}),
+    ([['所属部门', '总经办']], {'department': '总经办', 'role_name': 'AI架构师'}),
+    ([['所属部门', '另一部门']], None),
+    ([['所属公司及部门', '另一部门']], None),
+])
+def test_sop_department_alias_requires_consistent_explicit_values(extra, expected):
+    raw = docx(paragraph('岗位SOP') + table([['所属公司及部门', '总经办', '岗位名称', 'AI架构师'], *extra]))
+    assert kt.parse_text_file('岗位SOP.docx', raw).get('sop_metadata') == expected
+
+
+def test_sop_headings_step_acceptance_pairs_and_auxiliary_text_are_retained():
+    from rag_app.knowledge_chunking import split_structure_v2
+    raw = docx(paragraph('测试岗位标准作业程序') +
+               table([['字段', '内容', '字段', '内容'], ['所属部门', '总经办', '岗位名称', 'AI架构师']]) +
+               paragraph('开发流程', 'Heading1') + paragraph('标准操作步骤', 'Heading3') +
+               table([['步骤', '具体操作', '输出'], ['1', '先核对输入', '输入清单'], ['2', '随后修复', '变更']]) + paragraph('') +
+               table([['步骤', '验收标准', '异常处理'], ['2', '回归成功', '停止发布'], ['1', '输入齐全', '补齐输入']]), **{
+                   'word/header1.xml': '<w:hdr xmlns:w="%s">%s</w:hdr>' % (kt.W[1:-1], paragraph('内部使用')),
+                   'word/footer1.xml': '<w:ftr xmlns:w="%s">%s</w:ftr>' % (kt.W[1:-1], paragraph('第 1 页')),
+               })
+    result = kt.parse_text_file('岗位SOP.docx', raw)
+    assert result['sop_metadata'] == {'department': '总经办', 'role_name': 'AI架构师'}
+    assert result['issues'] == []
+    assert '| 1 | 先核对输入 | 输入清单 | 输入齐全 | 补齐输入 |' in result['text']
+    assert '| 2 | 随后修复 | 变更 | 回归成功 | 停止发布 |' in result['text']
+    assert '# 页眉\n内部使用' in result['text'] and '# 页脚\n第 1 页' in result['text']
+    assert any(location.get('source_tables') == [2, 3] for location in result['locations'])
+    chunks = split_structure_v2(result['text'])
+    step_chunk = next(chunk for chunk in chunks if '先核对输入' in chunk['source_text'])
+    assert step_chunk['section_path'] == ['开发流程', '标准操作步骤']
+    assert '验收标准' in step_chunk['source_text'] and '输入齐全' in step_chunk['source_text']
+
+
+def test_step_pairs_do_not_cross_sections_or_guess_missing_steps():
+    operations = table([['步骤', '具体操作'], ['1', '甲'], ['2', '乙']])
+    acceptance = table([['步骤', '验收标准'], ['1', '成功']])
+    result = kt.parse_text_file('test.docx', docx(operations + acceptance))
+    assert all(len(location.get('source_tables', [])) <= 1 for location in result['locations'])
+    acceptance = table([['步骤', '验收标准'], ['1', '成功'], ['2', '成功']])
+    result = kt.parse_text_file('test.docx', docx(operations + paragraph('下一流程', 'Heading1') + acceptance))
+    assert all(len(location.get('source_tables', [])) <= 1 for location in result['locations'])
+
+
+def test_sop_metadata_requires_explicit_consistent_fields_and_sop_title():
+    fields = table([['所属部门', '总经办', '岗位名称', 'AI架构师']])
+    assert 'sop_metadata' not in kt.parse_text_file('岗位SOP.docx', docx(paragraph('案例') + fields))
+    conflicting = fields + table([['岗位名称', '另一岗位']])
+    assert 'sop_metadata' not in kt.parse_text_file('sop.docx', docx(paragraph('岗位SOP') + conflicting))
+
+
+def test_sop_metadata_document_name_is_explicit_and_unambiguous():
+    fields = table([['所属部门', '总经办', '岗位名称', 'AI架构师'], ['文档名称', 'AI系统交付标准作业程序']])
+    body = paragraph('岗位SOP') + fields + paragraph('1 文档基本信息', 'Heading1')
+    result = kt.parse_text_file('sop.docx', docx(body))
+    assert result['sop_metadata'] == {
+        'department': '总经办', 'role_name': 'AI架构师', 'document_name': 'AI系统交付标准作业程序',
+    }
+    conflicting = body + table([['文档名称', '另一个名称']])
+    assert kt.parse_text_file('sop.docx', docx(conflicting))['sop_metadata'] == {
+        'department': '总经办', 'role_name': 'AI架构师',
+    }
+
+
+def test_docx_html_preview_escapes_all_document_text_and_does_not_change_bytes():
+    import hashlib
+    attack = '<script>alert(1)</script><img src="https://private.test" onerror="alert(2)">'
+    raw = docx(paragraph('中文预览', 'Heading1') + paragraph(attack) + table([['字段', '说明'], ['输入', attack]]))
+    before = hashlib.sha256(raw).hexdigest()
+    preview = kt.docx_html_preview(raw, '</title><script>evil()</script>').decode('utf-8')
+    assert '<h1>中文预览</h1>' in preview and '<table>' in preview
+    assert '&lt;script&gt;' in preview and 'Content-Security-Policy' in preview
+    assert hashlib.sha256(raw).hexdigest() == before
+    class Tags(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.tags = []
+        def handle_starttag(self, tag, attrs):
+            self.tags.append(tag)
+            assert not any(key.startswith('on') or key in {'src', 'href'} for key, value in attrs)
+    parser = Tags()
+    parser.feed(preview)
+    assert not {'script', 'img', 'iframe', 'object', 'a'} & set(parser.tags)
+
+
+def test_docx_preview_discloses_omissions_and_rejects_unsafe_xml():
+    preview = kt.docx_html_preview(docx(paragraph('正文') + '<w:p><w:r><w:drawing/></w:r></w:p>')).decode()
+    assert 'docx_nontext_content_not_parsed' in preview
+    with pytest.raises(ValueError, match='unsafe_xml_declaration'):
+        kt.docx_html_preview(office({'word/document.xml': '<!DOCTYPE doc []><doc/>'}))
+
+
 def test_xlsx_keeps_headers_rows_formula_and_cached_value_without_recalculation():
     from openpyxl import Workbook
 
@@ -101,7 +251,11 @@ def test_xlsx_keeps_headers_rows_formula_and_cached_value_without_recalculation(
     book.save(output)
     with zipfile.ZipFile(io.BytesIO(output.getvalue())) as archive:
         files = {item.filename: archive.read(item) for item in archive.infolist()}
-    files['xl/worksheets/sheet1.xml'] = files['xl/worksheets/sheet1.xml'].replace(b'<f>A2*2</f><v></v>', b'<f>A2*2</f><v>6</v>')
+    sheet = ET.fromstring(files['xl/worksheets/sheet1.xml'])
+    cached = sheet.find('.//s:c[@r="B2"]/s:v', {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'})
+    assert cached is not None
+    cached.text = '6'
+    files['xl/worksheets/sheet1.xml'] = ET.tostring(sheet)
     result = kt.parse_text_file('test.xlsx', office(files))
     assert '# 工作表 1：实测' in result['text'] and '# 工作表 2：边界' in result['text']
     assert 'A1="数量"' in result['text'] and 'B2=formula="=A2*2"; cached_value=6' in result['text']

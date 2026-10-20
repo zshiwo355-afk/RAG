@@ -68,6 +68,7 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS knowledge_upload_receipts (
       receipt_id TEXT PRIMARY KEY, principal TEXT NOT NULL, idempotency_key TEXT NOT NULL,
       source_id TEXT NOT NULL, filename TEXT NOT NULL, byte_length BIGINT NOT NULL,
+      ingestion_source TEXT NOT NULL DEFAULT 'legacy',
       sha256 TEXT NOT NULL, payload_hash TEXT NOT NULL, object_key TEXT NOT NULL UNIQUE,
       status TEXT NOT NULL, etag TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       lease_token TEXT, lease_until DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -80,7 +81,10 @@ _SCHEMA = (
 
 
 class ReceiptStore:
-    def __init__(self, path=None, *, database_url=None, clock=time.time):
+    def __init__(self, path=None, *, database_url=None, clock=time.time, object_prefix=PREFIX):
+        if not isinstance(object_prefix, str) or not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*/", object_prefix):
+            raise ReceiptError("invalid_receipt_object_prefix")
+        self.object_prefix = object_prefix
         if path is not None and database_url is not None:
             raise ReceiptError("invalid_receipt_database")
         self.database_url = database_url or (os.getenv("KNOWLEDGE_DATABASE_URL") if path is None else None)
@@ -131,6 +135,10 @@ class ReceiptStore:
                 self._lock(connection, "schema:knowledge-upload-receipts")
                 for statement in _SCHEMA:
                     connection.execute(statement)
+                if self.database_url:
+                    connection.execute("ALTER TABLE knowledge_upload_receipts ADD COLUMN IF NOT EXISTS ingestion_source TEXT NOT NULL DEFAULT 'legacy'")
+                elif 'ingestion_source' not in {r['name'] for r in connection.execute('PRAGMA table_info(knowledge_upload_receipts)')}:
+                    connection.execute("ALTER TABLE knowledge_upload_receipts ADD COLUMN ingestion_source TEXT NOT NULL DEFAULT 'legacy'")
             yield connection
             connection.commit()
         except BaseException:
@@ -143,8 +151,10 @@ class ReceiptStore:
         with self._connection(write=True, initialize=True):
             pass
 
-    def prepare(self, principal, payload):
+    def prepare(self, principal, payload, *, ingestion_source='legacy'):
         validate_principal(principal)
+        if ingestion_source not in {'legacy', 'agent_collector'}:
+            raise ReceiptError('invalid_ingestion_source', 400)
         payload = validate_payload(payload)
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         receipt_id, now = uuid.uuid4().hex, self.clock()
@@ -152,15 +162,15 @@ class ReceiptStore:
         with self._connection(write=True) as connection:
             self._execute(connection, """INSERT INTO knowledge_upload_receipts
                 (receipt_id, principal, idempotency_key, source_id, filename, byte_length,
-                 sha256, payload_hash, object_key, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_upload', ?, ?)
+                 sha256, payload_hash, object_key, status, created_at, updated_at, ingestion_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_upload', ?, ?, ?)
                 ON CONFLICT(principal, idempotency_key) DO NOTHING""",
                 (receipt_id, principal, payload["idempotency_key"], payload["source_id"], payload["filename"],
-                 payload["byte_length"], payload["sha256"], payload_hash, PREFIX + owner + "/" + receipt_id + "/source",
-                 now, now))
+                 payload["byte_length"], payload["sha256"], payload_hash, self.object_prefix + owner + "/" + receipt_id + "/source",
+                 now, now, ingestion_source))
             row = self._execute(connection, "SELECT * FROM knowledge_upload_receipts WHERE principal=? AND idempotency_key=?",
                                 (principal, payload["idempotency_key"])).fetchone()
-            if row["payload_hash"] != payload_hash:
+            if row["payload_hash"] != payload_hash or row['ingestion_source'] != ingestion_source:
                 raise ReceiptError("idempotency_conflict", 409)
             return dict(row)
 

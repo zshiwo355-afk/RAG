@@ -237,6 +237,71 @@ class MemoryObjects:
         return self.bodies[ref["object_key"]]
 
 
+def assert_role_initialization_preserves_existing_catalogue(store, capsys):
+    """Exercise the actual CLI against the two-table, pre-role schema."""
+    import knowledge
+    from rag_app.knowledge_governance import GovernanceStore
+    from rag_app.knowledge_service import KnowledgeService
+
+    store.initialize()
+    first = store.import_draft(draft())
+    store.publish("meeting-01", 1, expected_generation=first["generation"], confirmed_by="原审核人")
+    store.import_draft(draft(content="较新草稿不能替换正式版本"))
+    retired = store.import_draft(draft(knowledge_id="retired-01"))
+    store.publish("retired-01", 1, expected_generation=retired["generation"], confirmed_by="原审核人")
+    store.withdraw("retired-01")
+    published, assets = store.get_published("meeting-01"), store.list_assets()
+    with store._connection(write=True) as connection:
+        connection.execute("DROP TABLE knowledge_roles")
+
+    def rows():
+        with store._connection() as connection:
+            return [
+                [dict(row) for row in connection.execute("SELECT * FROM knowledge_assets ORDER BY knowledge_id")],
+                [dict(row) for row in connection.execute("SELECT * FROM knowledge_revisions ORDER BY knowledge_id,revision")],
+            ]
+
+    before = rows()
+    assert [len(table) for table in before] == [2, 3]
+    assert store.roles() == []
+    assert store.published_revisions(role_id="unknown") == [{"knowledge_id": "meeting-01", "revision": 1}]
+
+    class NoExternalAccess:
+        def __getattr__(self, name):
+            pytest.fail("role initialization must not call OSS, embedding or index: " + name)
+
+    original_objects, store.objects = store.objects, NoExternalAccess()
+    service = KnowledgeService(store=store, index=NoExternalAccess())
+    try:
+        assert knowledge.main(["init-db"], service=service) == 0
+        with store._connection() as connection:
+            assert not store._roles_ready(connection)
+        assert rows() == before
+        for _ in range(2):
+            assert knowledge.main(["init-db", "--execute"], service=service) == 0
+            output = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+            assert output["result"]["will_write_index"] is output["result"]["will_call_embedding"] is False
+            with store._connection() as connection:
+                assert store._roles_ready(connection)
+            assert rows() == before
+        # The processing init-db path delegates catalogue setup to this sidecar.
+        GovernanceStore(store).initialize()
+        GovernanceStore(store).initialize()
+        assert rows() == before and store.roles() == []
+    finally:
+        store.objects = original_objects
+    assert store.get_published("meeting-01") == published
+    assert store.list_assets() == assets
+    assert store.get_published("retired-01") is None
+    assert "role_id" not in published and "files" not in published
+
+
+@pytest.mark.parametrize("oss_reference", [False, True])
+def test_role_initialization_preserves_existing_sqlite_catalogue(tmp_path, capsys, oss_reference):
+    store = KnowledgeStore(tmp_path / "legacy.sqlite3", objects=MemoryObjects() if oss_reference else None)
+    assert_role_initialization_preserves_existing_catalogue(store, capsys)
+
+
 def test_oss_catalogue_keeps_only_reference_and_returns_full_body_without_private_ref(tmp_path):
     objects = MemoryObjects()
     path = tmp_path / "catalog.sqlite3"
@@ -357,6 +422,34 @@ def test_catalogue_filters_published_metadata_without_loading_any_body(tmp_path)
     store.withdraw("meeting-01")
     assert store.published_revisions(department="运营") == []
     assert objects.reads == reads
+
+
+def test_published_revision_source_is_from_published_metadata_not_latest_draft(tmp_path):
+    store = KnowledgeStore(tmp_path / "catalog.sqlite3")
+    first = store.import_draft(draft(department="运营", evidence={"ingestion_source": "agent_collector"}))
+    store.publish(first["knowledge_id"], 1, expected_generation=first["generation"], confirmed_by="离线审核")
+    store.import_draft(draft(department="品牌", evidence={"ingestion_source": "agent_collector"}))
+    expected = [{"knowledge_id": first["knowledge_id"], "revision": 1, "ingestion_source": "agent_collector"}]
+    assert store.published_revisions() == expected
+    assert store.published_revisions(department="运营") == expected
+    assert store.published_revisions(department="品牌") == []
+    store.withdraw("meeting-01")
+    assert store.published_revisions(department="运营") == []
+
+
+@pytest.mark.parametrize("original_source,new_source", [(None, "agent_collector"), ("legacy", "agent_collector"),
+                                                       ("agent_collector", None), ("agent_collector", "legacy")])
+def test_existing_asset_revisions_cannot_change_ingestion_source(tmp_path, original_source, new_source):
+    store = KnowledgeStore(tmp_path / "catalog.sqlite3")
+    original_evidence = {} if original_source is None else {"ingestion_source": original_source}
+    first = store.import_draft(draft(evidence=original_evidence))
+    store.publish(first["knowledge_id"], 1, expected_generation=first["generation"], confirmed_by="离线审核")
+    before = store.snapshot(first["knowledge_id"])
+    new_evidence = {} if new_source is None else {"ingestion_source": new_source}
+    with pytest.raises(ValueError, match="source_ingestion_source_conflict"):
+        store.import_draft(draft(content="修订内容不能改变资产的索引来源。", evidence=new_evidence))
+    assert store.snapshot(first["knowledge_id"]) == before
+    assert store.get_published(first["knowledge_id"])["revision"] == 1
 
 
 def test_public_catalog_uses_current_revision_and_only_public_relationship_targets(tmp_path):

@@ -82,6 +82,143 @@ def test_graph_is_incremental_and_excerpts_are_original_text(system):
     assert sum(reads.values()) == 3
 
 
+def test_restart_reuses_persisted_features_without_reading_originals(system):
+    catalog, queue, graph, reads, _ = system
+    publish(catalog, "left", "招聘岗位画像及候选人面试。[[right]]")
+    publish(catalog, "right", "候选人面试及招聘岗位画像。")
+    _, previous = ready(catalog, queue, graph)
+    reads.clear()
+
+    restarted = KnowledgeGraph(executor=Queued())
+    result = restarted.read(KnowledgeStore(catalog.path), _catalog_kind)
+
+    assert result["status"] == "ready"
+    assert result["edges"] == previous["edges"]
+    assert result["counts"]["indexed_assets"] == 2
+    assert not reads and not restarted.executor.tasks
+
+
+def test_same_publication_metadata_change_recomputes_reference_edges(system, monkeypatch):
+    catalog, queue, graph, reads, _ = system
+    publish(catalog, "left", "引用 [[原标题]]")
+    publish(catalog, "right", "目标正文", title="原标题")
+    _, before = ready(catalog, queue, graph)
+    assert before["counts"]["explicit_edges"] == 1
+    original = catalog.graph_internal_snapshot
+
+    def renamed_metadata():
+        rows = original()
+        for row in rows:
+            if row["knowledge_id"] == "right":
+                row["title"] = "新标题"
+        return rows
+
+    monkeypatch.setattr(catalog, "graph_internal_snapshot", renamed_metadata)
+    result = graph.read(catalog, _catalog_kind)
+    assert result["counts"]["explicit_edges"] == 0
+    assert sum(reads.values()) == 2 and not queue.tasks
+
+
+def test_corrupt_feature_cache_rebuilds_only_that_document(system):
+    catalog, queue, graph, reads, _ = system
+    publish(catalog, "left", "招聘岗位画像及候选人面试。")
+    publish(catalog, "right", "候选人面试及招聘岗位画像。")
+    ready(catalog, queue, graph)
+    with catalog._connection(write=True) as connection:
+        connection.execute("UPDATE knowledge_graph_features SET features_json=? WHERE knowledge_id='left'",
+                           (json.dumps({"terms": "bad", "mentions": [], "snippets": {}}),))
+    reads.clear()
+    restarted = KnowledgeGraph(executor=queue)
+    first, result = ready(KnowledgeStore(catalog.path), queue, restarted)
+    assert first["counts"]["indexed_assets"] == 1 and result["counts"]["indexed_assets"] == 2
+    assert reads == Counter({(str(catalog.path), "left"): 1})
+
+
+def test_postcommit_warm_uses_published_content_without_source_reads(system, monkeypatch):
+    from rag_app import knowledge_graph
+    catalog, queue, _, reads, _ = system
+    published = publish(catalog, "left", "招聘岗位画像及候选人面试。")
+    monkeypatch.setattr(knowledge_graph, "_warm_executor", queue)
+    knowledge_graph.cache_published_features(catalog, published)
+    knowledge_graph.cache_published_features(catalog, published)
+    assert len(queue.tasks) == 1
+    queue.finish()
+    restarted = KnowledgeGraph(executor=queue)
+    assert restarted.read(KnowledgeStore(catalog.path), _catalog_kind)["status"] == "ready"
+    assert not reads and not queue.tasks
+
+
+def test_restart_after_update_reads_only_changed_body_and_never_withdrawn_cache(system):
+    catalog, queue, graph, reads, _ = system
+    old = publish(catalog, "left", "旧引用 [[right]]")
+    publish(catalog, "right", "目标正文")
+    ready(catalog, queue, graph)
+    old_feature = _features(old, old["content"])
+    current = publish(catalog, "left", "新版没有引用")
+    reads.clear()
+    _, result = ready(KnowledgeStore(catalog.path), queue, KnowledgeGraph(executor=queue))
+    assert not result["edges"]
+    assert reads == Counter({(str(catalog.path), "left"): 1})
+    from rag_app.knowledge_graph import ALGORITHM_VERSION
+    assert catalog.save_graph_features(old, ALGORITHM_VERSION, old_feature) is False
+    cached = {row["knowledge_id"]: row for row in catalog.graph_features(ALGORITHM_VERSION)}
+    assert cached["left"]["revision"] == current["revision"]
+    catalog.withdraw("right")
+    reads.clear()
+    final = KnowledgeGraph(executor=queue).read(KnowledgeStore(catalog.path), _catalog_kind)
+    assert final["status"] == "ready" and final["counts"]["indexed_assets"] == 1
+    assert [node["knowledge_id"] for node in final["nodes"]] == ["left"]
+    assert not final["edges"] and not reads and not queue.tasks
+
+
+def test_persistent_cache_version_and_database_isolation(system, tmp_path, monkeypatch):
+    from rag_app import knowledge_graph
+    catalog, queue, graph, reads, _ = system
+    publish(catalog, "same", "原库正文")
+    ready(catalog, queue, graph)
+    reads.clear()
+    monkeypatch.setattr(knowledge_graph, "ALGORITHM_VERSION", "synthetic-next-algorithm")
+    _, result = ready(catalog, queue, KnowledgeGraph(executor=queue))
+    assert result["status"] == "ready" and sum(reads.values()) == 1
+    other = KnowledgeStore(tmp_path / "isolated.sqlite3")
+    other.initialize()
+    publish(other, "same", "独立库正文")
+    first, _ = ready(other, queue, KnowledgeGraph(executor=queue))
+    assert first["counts"]["indexed_assets"] == 0
+    assert reads[(str(other.path), "same")] == 1
+
+
+def test_missing_cache_table_keeps_legacy_reads_read_only(system):
+    catalog, queue, graph, reads, _ = system
+    publish(catalog, "left", "旧库正文")
+    with catalog._connection(write=True) as connection:
+        connection.execute("DROP TABLE knowledge_graph_features")
+    before = catalog.path.read_bytes()
+    _, result = ready(catalog, queue, graph)
+    assert result["status"] == "ready" and sum(reads.values()) == 1
+    assert catalog.path.read_bytes() == before
+    with catalog._connection() as connection:
+        assert connection.execute("SELECT 1 FROM sqlite_master WHERE name='knowledge_graph_features'").fetchone() is None
+
+
+def test_warm_queue_is_bounded_and_failed_rebuild_keeps_good_features(system, monkeypatch):
+    from rag_app import knowledge_graph
+    catalog, queue, _, reads, _ = system
+    publications = [publish(catalog, f"item-{index}", "岗位画像及候选人面试")
+                    for index in range(knowledge_graph.MAX_WARM_JOBS + 1)]
+    monkeypatch.setattr(knowledge_graph, "_warm_executor", queue)
+    for record in publications:
+        knowledge_graph.cache_published_features(catalog, record)
+    assert len(queue.tasks) == knowledge_graph.MAX_WARM_JOBS
+    queue.finish()
+    previous = catalog.graph_features(knowledge_graph.ALGORITHM_VERSION)
+    monkeypatch.setattr(knowledge_graph, "_features", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic failure")))
+    knowledge_graph.cache_published_features(catalog, publications[0])
+    queue.finish()
+    assert catalog.graph_features(knowledge_graph.ALGORITHM_VERSION) == previous
+    assert not knowledge_graph._warm_pending and not reads
+
+
 def test_edges_are_cached_until_publications_or_completed_features_change(system, monkeypatch):
     catalog, queue, graph, _, _ = system
     from rag_app import knowledge_graph

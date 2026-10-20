@@ -141,6 +141,48 @@ def test_idempotency_is_atomic_payload_bound_and_principal_scoped(system):
         system.service.complete("user:b", rows[0]["receipt_id"])
 
 
+@pytest.mark.parametrize("original,new", [("legacy", "agent_collector"), ("agent_collector", "legacy")])
+def test_same_idempotency_key_cannot_change_server_ingestion_source(system, original, new):
+    first = system.store.prepare("user:a", payload(), ingestion_source=original)
+    with pytest.raises(ReceiptError, match="idempotency_conflict") as error:
+        system.store.prepare("user:a", payload(), ingestion_source=new)
+    assert error.value.status_code == 409
+    assert system.store.get("user:a", first["receipt_id"]) == first
+    assert system.store.prepare("user:a", payload(), ingestion_source=original) == first
+
+
+def test_old_sqlite_receipts_migrate_without_changing_payload_or_idempotent_identity(tmp_path):
+    path = tmp_path / "legacy-receipts.db"
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("""CREATE TABLE knowledge_upload_receipts (
+            receipt_id TEXT PRIMARY KEY, principal TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+            source_id TEXT NOT NULL, filename TEXT NOT NULL, byte_length BIGINT NOT NULL,
+            sha256 TEXT NOT NULL, payload_hash TEXT NOT NULL, object_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL, etag TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+            lease_token TEXT, lease_until DOUBLE PRECISION NOT NULL DEFAULT 0,
+            available_at DOUBLE PRECISION NOT NULL DEFAULT 0, error_code TEXT,
+            created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL,
+            UNIQUE(principal, idempotency_key))""")
+        old_payload = payload()
+        payload_hash = hashlib.sha256(json.dumps(old_payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        connection.execute("""INSERT INTO knowledge_upload_receipts
+            (receipt_id,principal,idempotency_key,source_id,filename,byte_length,sha256,payload_hash,
+             object_key,status,etag,attempts,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,'verified','old-etag',2,100,200)""",
+            ("a" * 32, "user:a", old_payload["idempotency_key"], old_payload["source_id"], old_payload["filename"],
+             old_payload["byte_length"], old_payload["sha256"], payload_hash, "old-prefix/retained-source"))
+        before = dict(connection.execute("SELECT * FROM knowledge_upload_receipts").fetchone())
+        assert "ingestion_source" not in before
+    store = ReceiptStore(path)
+    store.initialize()
+    store.initialize()
+    assert store.get("user:a", before["receipt_id"]) == {**before, "ingestion_source": "legacy"}
+    assert store.prepare("user:a", old_payload) == {**before, "ingestion_source": "legacy"}
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM knowledge_upload_receipts").fetchone()[0] == 1
+
+
 def test_expired_lease_recovery_fences_previous_worker_and_limits_global_concurrency(system):
     row = pending(system)
     second = pending(system, idempotency_key="second")
@@ -272,6 +314,7 @@ def test_api_auth_owner_boundary_extra_fields_and_disabled_default(system, monke
             other = {**headers, "X-Knowledge-Principal": "user:b"}
             assert getattr(client, method)(target, headers=other, **kwargs).status_code == 404
         assert client.post(path, json=payload(principal="user:b"), headers=headers).status_code == 422
+        assert client.post(path, json=payload(ingestion_source="agent_collector"), headers=headers).status_code == 422
         assert client.post(receipt_path + "/complete", json={"object_key": "other"}, headers=headers).status_code == 422
         assert client.post(path, json=payload(byte_length=True), headers=headers).status_code == 422
         for filename in ("../other", "control\u0085.json", "bidi\u202e.json", "surrogate\ud800.json"):

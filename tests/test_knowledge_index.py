@@ -49,7 +49,8 @@ class TableClient:
     """Each cloud operation is scoped to a table; no network or credential reads."""
 
     def __init__(self):
-        self.tables = {"company_knowledge": {}, "text_docs": {"product-a": {"id": "product-a"}}}
+        self.tables = {"company_knowledge": {}, index.COLLECTOR_TABLE_NAME: {},
+                       "text_docs": {"product-a": {"id": "product-a"}}}
         self.calls = []
         self.skip_id = None
         self.fetch_delay = 0
@@ -66,12 +67,13 @@ class TableClient:
     def push_documents(self, source, primary_key, request):
         self.calls.append(("push", source, request.to_map()))
         assert primary_key == "id"
-        assert source in ("company_knowledge", "inst_company_knowledge")
+        table = source.removeprefix("inst_")
+        assert table in ("company_knowledge", index.COLLECTOR_TABLE_NAME)
         for document in request.body:
             assert document["cmd"] == "add"
             fields = dict(document["fields"])
             if fields["id"] != self.skip_id:
-                self.tables["company_knowledge"][fields["id"]] = fields
+                self.tables[table][fields["id"]] = fields
         return SimpleNamespace(body=self.push_body)
 
     def fetch(self, request):
@@ -157,9 +159,9 @@ def cloud(monkeypatch):
     return fake, calls, config
 
 
-def seed(fake, document, score=1):
+def seed(fake, document, score=1, table="company_knowledge"):
     for chunk in index.chunk_document(document):
-        fake.tables["company_knowledge"][chunk["id"]] = {**chunk, "test_score": score}
+        fake.tables[table][chunk["id"]] = {**chunk, "test_score": score}
 
 
 def test_chunk_identity_hash_overlap_and_title_limit():
@@ -598,6 +600,151 @@ def test_invalid_revision_filter_cannot_reach_cloud(cloud):
         index.KnowledgeIndex().search("method", [{"knowledge_id": 'x\" OR true', "revision": 1}], 5)
     assert calls == {"client": 0, "embeddings": []}
     assert fake.calls == []
+
+
+def test_collector_index_requires_its_own_read_and_write_targets(cloud, monkeypatch):
+    fake, _, _ = cloud
+    collector = index.KnowledgeIndex(ingestion_source="agent_collector")
+    collector._connect()
+    assert collector.table == index.COLLECTOR_TABLE_NAME
+    # The official datasource is configured by the fixture; it must never be a fallback.
+    with pytest.raises(index.KnowledgeIndexError):
+        collector._datasource()
+    monkeypatch.setenv("KNOWLEDGE_COLLECTOR_PUSH_DATASOURCE", "inst_" + index.COLLECTOR_TABLE_NAME)
+    assert collector._datasource() == "inst_" + index.COLLECTOR_TABLE_NAME
+    monkeypatch.setenv("KNOWLEDGE_COLLECTOR_TABLE", index.HYBRID_TABLE_NAME)
+    with pytest.raises(index.KnowledgeIndexError):
+        index.KnowledgeIndex(ingestion_source="agent_collector")._connect()
+    monkeypatch.setenv("KNOWLEDGE_TABLE", index.COLLECTOR_TABLE_NAME)
+    with pytest.raises(index.KnowledgeIndexError):
+        index.KnowledgeIndex()._connect()
+    assert fake.calls == []
+
+
+def test_default_index_routes_collector_writes_and_retries_without_touching_original_table(cloud, monkeypatch):
+    fake, _, _ = cloud
+    monkeypatch.setenv("KNOWLEDGE_COLLECTOR_PUSH_DATASOURCE", "inst_" + index.COLLECTOR_TABLE_NAME)
+    original = record("original")
+    client = index.KnowledgeIndex()
+    client.index_and_verify(original)
+    before = dict(fake.tables[index.TABLE_NAME])
+    fake.calls.clear()
+    automatic = {**record("collected"), "evidence": {"ingestion_source": "agent_collector"}}
+    first = client.index_and_verify(automatic, require_keyword=True)
+    assert client.index_and_verify(automatic, require_keyword=True) == first
+    assert first["table"] == index.COLLECTOR_TABLE_NAME
+    assert fake.tables[index.TABLE_NAME] == before
+    assert len(fake.tables[index.COLLECTOR_TABLE_NAME]) == 1
+    assert all(target.removeprefix("inst_") == index.COLLECTOR_TABLE_NAME for _, target, _ in fake.calls)
+
+
+@pytest.mark.parametrize("metadata", [
+    {"source_format": "source-v2", "table": index.COLLECTOR_TABLE_NAME},
+    {"ingestion_source": "agent_collector"},
+])
+def test_write_routing_ignores_client_style_table_and_top_level_source_fields(cloud, metadata):
+    fake, _, _ = cloud
+    result = index.KnowledgeIndex().index_and_verify({**record(), **metadata})
+    assert result["table"] == index.TABLE_NAME
+    assert fake.tables[index.COLLECTOR_TABLE_NAME] == {}
+
+
+@pytest.mark.parametrize("failure", ["missing_source", "wrong_source", "write_error"])
+def test_collector_write_failure_never_falls_back_to_original_table(cloud, monkeypatch, failure):
+    fake, _, _ = cloud
+    if failure == "wrong_source":
+        monkeypatch.setenv("KNOWLEDGE_COLLECTOR_PUSH_DATASOURCE", "inst_company_knowledge")
+    elif failure == "write_error":
+        monkeypatch.setenv("KNOWLEDGE_COLLECTOR_PUSH_DATASOURCE", index.COLLECTOR_TABLE_NAME)
+        fake.push_body = {"status": "ERROR"}
+    with pytest.raises(index.KnowledgeIndexError):
+        index.KnowledgeIndex().index_and_verify({**record(), "evidence": {"ingestion_source": "agent_collector"}})
+    assert fake.tables[index.TABLE_NAME] == {}
+    assert all(target == index.COLLECTOR_TABLE_NAME for _, target, _ in fake.calls)
+
+
+def test_search_merges_table_candidates_before_global_ranks_and_rechecks_each_allowlist(cloud, monkeypatch):
+    fake, calls, _ = cloud
+    original = record("original")
+    automatic = {**record("collected"), "ingestion_source": "agent_collector"}
+    seed(fake, original, score=1)
+    seed(fake, automatic, score=2, table=index.COLLECTOR_TABLE_NAME)
+    seed(fake, record("collected", revision=2), score=999, table=index.COLLECTOR_TABLE_NAME)
+    # An index returning a valid row from the wrong table/partition cannot contribute it.
+    extra = index.chunk_document(record("not-published"))[0]
+    fake.extra_hits = [{"fields": extra, "score": 1000}]
+    original_query = fake.query
+
+    def query(request):
+        response = original_query(request)
+        wrong_table = original if request.table_name == index.COLLECTOR_TABLE_NAME else automatic
+        response.body["result"].append({"fields": index.chunk_document(wrong_table)[0], "score": 999})
+        return response
+
+    monkeypatch.setattr(fake, "query", query)
+    found = index.KnowledgeIndex().search("公司方法", [original, automatic], 10)
+    assert [row["knowledge_id"] for row in found] == ["collected", "original"]
+    assert found[0]["route_ranks"] == {"text_dense": 1, "text_keyword": 1}
+    assert found[1]["route_ranks"] == {"text_dense": 2, "text_keyword": 2}
+    assert calls["embeddings"] == ["公司方法"]
+    assert len(fake.calls) == 4
+    for _, table, request in fake.calls:
+        key = "collected__r1" if table == index.COLLECTOR_TABLE_NAME else "original__r1"
+        assert request.get("filter", request.get("text", {}).get("filter")) == index._filter([key])
+
+
+def test_conflicting_or_unknown_source_is_rejected_before_any_cloud_read(cloud):
+    fake, calls, _ = cloud
+    for allowed in ([record(), {**record(), "ingestion_source": "agent_collector"}],
+                    [{**record(), "ingestion_source": "other-table"}]):
+        with pytest.raises(index.KnowledgeIndexError, match="ingestion source"):
+            index.KnowledgeIndex().search("方法", allowed, 5)
+    assert fake.calls == [] and calls["embeddings"] == []
+
+
+def test_collector_read_failure_does_not_return_partial_original_results(cloud, monkeypatch):
+    fake, _, _ = cloud
+    original = record("original")
+    seed(fake, original)
+    original_query = fake.query
+
+    def query(request):
+        if request.table_name == index.COLLECTOR_TABLE_NAME:
+            raise RuntimeError("collector table unavailable")
+        return original_query(request)
+
+    monkeypatch.setattr(fake, "query", query)
+    with pytest.raises(index.KnowledgeIndexError):
+        index.KnowledgeIndex().search("方法", [original, {**record("collected"), "ingestion_source": "agent_collector"}], 5)
+
+
+def test_service_reranks_both_tables_once_and_applies_existing_no_answer_filter(cloud, monkeypatch, tmp_path):
+    from rag_app import knowledge_relevance, rerank_service
+    from rag_app.knowledge_service import KnowledgeService
+    from rag_app.knowledge_store import KnowledgeStore
+
+    monkeypatch.setenv("KNOWLEDGE_COLLECTOR_PUSH_DATASOURCE", index.COLLECTOR_TABLE_NAME)
+    service = KnowledgeService(KnowledgeStore(tmp_path / "catalog.sqlite3"), index.KnowledgeIndex())
+    for key, source in (("original", "legacy"), ("collected", "agent_collector")):
+        service.import_document({**record(key, title=key), "sources": [{"name": "离线验收样本"}],
+                                 "evidence": {"ingestion_source": source}}, execute=True)
+        service.publish(key, confirmed_by="离线审核", execute=True)
+    reranks, relevance = [], []
+
+    def rerank(query, documents):
+        reranks.append(documents)
+        return [0.8] * len(documents)
+
+    def supported(query, documents):
+        relevance.append(documents)
+        return set() if query == "无依据的问题" else set(range(len(documents)))
+
+    monkeypatch.setattr(rerank_service, "call_rerank_model", rerank)
+    monkeypatch.setattr(knowledge_relevance, "supported_indices", supported)
+    assert {row["knowledge_id"] for row in service.search("方法")} == {"original", "collected"}
+    assert len(reranks) == len(relevance) == 1 and len(reranks[0]) == len(relevance[0]) == 2
+    assert service.search("无依据的问题") == []
+    assert len(reranks) == len(relevance) == 2
 
 
 def test_real_api_store_and_index_publication_lifecycle(cloud, tmp_path):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -21,6 +21,8 @@ class KnowledgeSearchRequest(BaseModel):
     include_content: bool = Field(True, strict=True)
     department: Optional[str] = Field(None, min_length=1, max_length=200)
     scenario: Optional[str] = Field(None, min_length=1, max_length=200)
+    role_id: Optional[str] = Field(None, pattern=r"^role_[0-9a-f]{24}$")
+    category: Optional[Literal["sop", "skill", "other"]] = None
     model_config = {"extra": "forbid"}
 
 
@@ -31,9 +33,12 @@ def get_knowledge_service() -> KnowledgeService:
 @router.post("/search")
 def search_knowledge(request: KnowledgeSearchRequest, service: KnowledgeService = Depends(get_knowledge_service)):
     try:
+        role_filters = {key: value for key, value in {"role_id": request.role_id, "category": request.category}.items()
+                        if value is not None}
         results = service.search(
             request.query, request.top_k, include_content=request.include_content,
             department=request.department, scenario=request.scenario,
+            **role_filters,
         )
         return {"ok": True, "query": request.query.strip(), "result_count": len(results), "results": results}
     except ValueError as exc:

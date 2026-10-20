@@ -23,7 +23,7 @@ def supported_indices(query: str, documents: list[str]) -> set[int]:
     for i, text in enumerate(documents):
         title, _, body = text.partition("\n\n")
         sources.append({"index": i, "title": title, "spans": [
-            {"index": j, "text": body[start:start + 160]}
+            {"span_index": j, "text": body[start:start + 160]}
             for j, start in enumerate(range(0, len(body), 160))
         ]})
     response = answer_service.post_json(

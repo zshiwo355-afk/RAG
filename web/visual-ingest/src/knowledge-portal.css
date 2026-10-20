@@ -67,13 +67,18 @@
 .section-caption { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: #54595d; margin-bottom: 10px; }
 .section-caption > span:first-child { color: #54595d; font-weight: 600; font-size: 13px; }
 .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 20px; border-block: 1px solid #eaecf0; padding: 16px 0; }
-.metric { padding: 0; background: transparent; border: 0; min-height: 0; }
+.metric { display: flex; flex-direction: column; align-items: stretch; padding: 8px; margin: -8px; background: transparent; border: 0; min-height: 0; text-align: left; font: inherit; color: inherit; border-radius: 4px; }
+.metric:enabled:hover { background: #f8f9fa; }
+.metric:focus-visible { outline: 2px solid #36c; outline-offset: 3px; }
+.metric:disabled { cursor: default; }
+.metric-link { display: block; margin-top: 10px; color: #36c; font-size: 12px; }
+.metric:disabled .metric-link { color: #72777d; }
 .metric.featured { background: transparent; border: 0; }
 .metric-title { font-size: 12px; color: #54595d; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .metric-title > span:not(.attention-dot) { color: #54595d; background: #eaecf0; border-radius: 3px; padding: 1px 5px; font-size: 12px; }
-.metric-number { font-size: 26px; font-weight: 500; line-height: 1.4; margin: 6px 0; }
+.metric-number { display: block; font-size: 26px; font-weight: 500; line-height: 1.4; margin: 6px 0; }
 .metric-number small { font: 11px "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: 0; color: #72777d; padding-left: 7px; }
-.metric p { color: #54595d; font-size: 13px; line-height: 1.7; }
+.metric-description { display: block; flex: 1; color: #54595d; font-size: 13px; line-height: 1.7; }
 .attention-dot { width: 6px; height: 6px; background: #72777d; border-radius: 50%; }
 .processing-section { margin-top: 32px; border: 0; border-top: 1px solid #a2a9b1; border-radius: 0; background: #fff; overflow: hidden; }
 .list-heading { display: flex; justify-content: space-between; align-items: flex-start; padding: 24px 24px 22px; gap: 18px; }
@@ -93,6 +98,8 @@
 .file-symbol { background: #f8f9fa; border: 1px solid #eaecf0; color: #72777d; font-size: 22px; line-height: 1; width: 32px; height: 38px; display: inline-flex; align-items: center; justify-content: center; border-radius: 4px; flex-shrink: 0; }
 .job-name strong { display: block; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
 .job-name small { display: block; font-size: 12px; color: #54595d; margin-top: 5px; letter-spacing: .03em; }
+.knowledge-portal .upload-attribution, .knowledge-detail .upload-attribution { margin: 8px 0; color: #54595d; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.jobs-table .upload-attribution { max-width: 380px; }
 .status-badge { display: inline-flex; align-items: center; gap: 5px; border-radius: 4px; padding: 3px 7px; white-space: nowrap; color: #54595d; background: #f8f9fa; font-size: 13px; font-weight: 500; }
 .status-badge > span { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
 .status-badge.completed, .status-badge.draft, .status-badge.published { background: #f8f9fa; color: #54595d; }
@@ -151,8 +158,8 @@
 .resolution-form legend, .resolution-form > label { display: block; margin-bottom: 7px; font-size: 12px; font-weight: 600; color: #202122; }
 .resolution-form .resolution-choice { display: flex; align-items: center; gap: 7px; font-size: 12px; color: #54595d; }
 .resolution-choice input { accent-color: var(--archive-green); }
-.resolution-form > input, .resolution-form textarea { box-sizing: border-box; width: 100%; border: 1px solid #c8ccd1; border-radius: 5px; padding: 10px 12px; color: var(--archive-ink); font: inherit; font-size: 12px; background: #fff; }
-.resolution-form textarea { resize: vertical; min-height: 86px; }
+.resolution-form > input, .resolution-form textarea, .repair-instructions { box-sizing: border-box; width: 100%; border: 1px solid #c8ccd1; border-radius: 5px; padding: 10px 12px; color: var(--archive-ink); font: inherit; font-size: 12px; background: #fff; }
+.resolution-form textarea, .repair-instructions { resize: vertical; min-height: 86px; }
 .resolution-form .field-note { font-size: 13px; color: #54595d; line-height: 1.8; margin: 7px 0 16px; }
 .resolution-buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .event-list { list-style: none; margin: 0; padding: 0; }
@@ -176,3 +183,22 @@
 .entry-form h1 { font-size: 26px; margin: 0 0 12px; }
 @media (max-width: 900px) { .portal-shell { grid-template-columns: 156px minmax(0, 1fr); } .portal-sidebar { padding: 24px 14px; } .portal-main { padding: 26px 24px; } .portal-topbar { padding-inline: 24px; } }
 @media (max-width: 680px) { .portal-shell { display: block; } .portal-sidebar { position: static; height: auto; display: block; padding: 18px; border-right: 0; border-bottom: 1px solid #eaecf0; } .portal-main { padding: 24px 18px; } .metric { min-height: 0; padding: 0; } .portal-topbar { height: 46px; padding-inline: 18px; } .page-heading h1 { font-size: 24px; } .entry-form { margin: auto; } }
+
+.technical-details { margin: 12px 0; color: #54595d; font-size: 13px; overflow-wrap: anywhere; }
+.technical-details > summary { cursor: pointer; padding: 6px 0; }
+.technical-details > summary:focus-visible { outline: 2px solid #36c; outline-offset: 2px; }
+
+/* Independent tracking pages share the existing form and table styles. */
+.tracking-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; padding: 0 24px 22px; }
+.tracking-filters label { display: flex; flex: 1 1 160px; flex-direction: column; gap: 7px; min-width: 0; font-size: 12px; color: #54595d; }
+.tracking-filters input, .tracking-filters select { width: 100%; min-height: 38px; border: 1px solid #a2a9b1; border-radius: 3px; padding: 7px 9px; background: white; color: #202122; font: inherit; }
+.tracking-filters input:focus-visible, .tracking-filters select:focus-visible { outline: 2px solid #36c; outline-offset: 2px; }
+.filter-actions { display: flex; gap: 8px; }
+@media (max-width: 680px) {
+  .metric { margin: 0; min-width: 0; }
+  .metric-title { flex-wrap: wrap; gap: 4px; }
+  .portal-topbar { height: auto; min-height: 56px; padding-block: 10px; gap: 12px; }
+  .identity { flex-wrap: wrap; justify-content: flex-end; }
+  .identity .text-button { white-space: nowrap; }
+}
+@media (max-width: 680px) { .tracking-filters { padding: 0 16px 18px; } .tracking-filters label { flex-basis: 140px; } .knowledge-navigation { flex-wrap: wrap; } }

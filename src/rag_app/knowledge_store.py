@@ -50,6 +50,31 @@ def _uploader_position(record, receipts):
     return position
 
 
+def knowledge_category(record):
+    """Three navigation categories, independent of contributor attribution."""
+    if record.get("category") in {"sop", "skill", "other"}:
+        return record["category"]
+    kind = str(record.get("kind", "")).strip().lower()
+    if kind in {"process", "sop", "流程"}:
+        return "sop"
+    if kind == "skill" or record.get("source_type", record.get("evidence", {}).get("source_type")) == "Skill方法":
+        return "skill"
+    return "other"
+
+
+def _role_label(value, field):
+    value = _text(value, field)
+    if len(value) > 200 or re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError("invalid_" + field)
+    return value
+
+
+def validate_role_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"role_[0-9a-f]{24}", value):
+        raise ValueError("invalid_role_id")
+    return value
+
+
 def normalize_entry(entry: dict) -> dict:
     """Validate a draft without touching storage and include its stable hashes."""
     if not isinstance(entry, dict):
@@ -96,6 +121,21 @@ def normalize_entry(entry: dict) -> dict:
         payload["department"] = _text(entry["department"], "department")
         if len(payload["department"]) > 200:
             raise ValueError("department exceeds the 200-character limit")
+    if "role_id" in entry:
+        payload["role_id"] = validate_role_id(entry["role_id"])
+    if "role_name" in entry:
+        payload["role_name"] = _role_label(entry["role_name"], "role_name")
+    if "category" in entry:
+        if entry["category"] not in {"sop", "skill", "other"}:
+            raise ValueError("invalid_knowledge_category")
+        payload["category"] = entry["category"]
+    if "files" in entry:
+        from .knowledge_files import validate_file_descriptor
+        if not isinstance(entry["files"], list) or len(entry["files"]) > 20:
+            raise ValueError("invalid_knowledge_files")
+        payload["files"] = [validate_file_descriptor(item) for item in entry["files"]]
+        if len({item["file_id"] for item in payload["files"]}) != len(payload["files"]):
+            raise ValueError("duplicate_knowledge_file")
     if "scenarios" in entry:
         scenarios = entry["scenarios"]
         if not isinstance(scenarios, list) or len(scenarios) > 20:
@@ -114,6 +154,10 @@ def normalize_entry(entry: dict) -> dict:
 
 
 _SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS knowledge_roles (
+        role_id TEXT PRIMARY KEY, department TEXT NOT NULL, name TEXT NOT NULL,
+        created_at TEXT NOT NULL, UNIQUE (department, name)
+    )""",
     """CREATE TABLE IF NOT EXISTS knowledge_assets (
         knowledge_id TEXT PRIMARY KEY, latest_revision BIGINT NOT NULL,
         published_revision BIGINT, generation BIGINT NOT NULL,
@@ -126,6 +170,12 @@ _SCHEMA = (
         was_published INTEGER NOT NULL DEFAULT 0,
         confirmed_by TEXT, published_at TEXT,
         PRIMARY KEY (knowledge_id, revision)
+    )""",
+    """CREATE TABLE IF NOT EXISTS knowledge_graph_features (
+        knowledge_id TEXT NOT NULL, algorithm_version TEXT NOT NULL,
+        revision BIGINT NOT NULL, content_hash TEXT NOT NULL,
+        published_at TEXT NOT NULL, features_json TEXT NOT NULL,
+        PRIMARY KEY (knowledge_id, algorithm_version)
     )""",
 )
 
@@ -164,6 +214,123 @@ class KnowledgeStore:
 
             self.objects = KnowledgeObjects()
         return self.objects
+
+    def _roles_ready(self, connection):
+        if connection is None:
+            return False
+        if self.database_url:
+            return connection.execute("SELECT to_regclass('knowledge_roles') IS NOT NULL AS ready").fetchone()["ready"]
+        return connection.execute("SELECT 1 FROM sqlite_master WHERE name='knowledge_roles'").fetchone() is not None
+
+    def register_role(self, department, name, *, existing_department=False):
+        """Register an explicit role; portal additions require an existing department."""
+        department, name = _role_label(department, "department"), _role_label(name, "role_name")
+        role_id = "role_" + hashlib.sha256(_json([department, name]).encode()).hexdigest()[:24]
+        with self._connection(write=True) as connection:
+            if existing_department and not self._execute(connection,
+                    "SELECT 1 FROM knowledge_roles WHERE department=? LIMIT 1", (department,)).fetchone():
+                raise ValueError("role_department_not_found")
+            self._execute(connection, """INSERT INTO knowledge_roles (role_id,department,name,created_at)
+                VALUES (?,?,?,?) ON CONFLICT (department,name) DO NOTHING""",
+                (role_id, department, name, datetime.now(timezone.utc).isoformat()))
+            return dict(self._execute(connection, "SELECT role_id,department,name FROM knowledge_roles WHERE department=? AND name=?",
+                                      (department, name)).fetchone())
+
+    def role(self, role_id):
+        validate_role_id(role_id)
+        with self._connection() as connection:
+            if not self._roles_ready(connection):
+                return None
+            row = self._execute(connection, "SELECT role_id,department,name FROM knowledge_roles WHERE role_id=?", (role_id,)).fetchone()
+            return dict(row) if row is not None else None
+
+    def bind_role(self, entry, *, create_from_sop=False):
+        """Validate explicit membership. Legacy records remain unassigned."""
+        if not entry.get("role_id") and not entry.get("role_name"):
+            return entry
+        department = _role_label(entry.get("department"), "department")
+        name = _role_label(entry.get("role_name"), "role_name")
+        if entry.get("role_id"):
+            role = self.role(entry["role_id"])
+            if role is None:
+                raise ValueError("unknown_role_id")
+        elif create_from_sop and knowledge_category(entry) == "sop":
+            role = self.register_role(department, name)
+        else:
+            raise ValueError("role_id_required")
+        if (role["department"], role["name"]) != (department, name):
+            raise ValueError("role_metadata_mismatch")
+        return {**entry, "role_id": role["role_id"], "department": department, "role_name": name}
+
+    def uploader_roles_ready(self, connection):
+        if self.database_url:
+            return connection.execute("SELECT to_regclass('knowledge_uploader_roles') IS NOT NULL AS ready").fetchone()["ready"]
+        return connection.execute("SELECT 1 FROM sqlite_master WHERE name='knowledge_uploader_roles'").fetchone() is not None
+
+    def uploader_role(self, connection, principal):
+        # Reads on an older installation must not run a schema migration.
+        if principal is None or not self.uploader_roles_ready(connection):
+            return None
+        row = self._execute(connection, """SELECT u.*,r.department,r.name FROM knowledge_uploader_roles u
+            JOIN knowledge_roles r ON r.role_id=u.role_id WHERE u.principal=?""", (principal,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def bind_uploader_role(self, connection, entry, previous=None, *, principal=None):
+        """Resolve a declared employee position against existing roles only."""
+        evidence = dict(entry.get("evidence", {}))
+        evidence.pop("uploader_role_confirmation", None)
+        entry = {**entry, "evidence": evidence}
+        position = evidence.get("source_uploader_position")
+        label = lambda value: " ".join(value.split()) if isinstance(value, str) else ""
+        position, department = label(position), label(evidence.get("source_uploader_department"))
+        # These legacy placeholders were never accepted as employee declarations.
+        if position in {"未知", "未确认", "待补充", "未取得", "未提供", "待填写"}:
+            position = ""
+        if previous and previous.get("role_id"):
+            fields = ("role_id", "department", "role_name")
+            declared = label(previous.get("evidence", {}).get("source_uploader_position"))
+            declared_department = label(previous.get("evidence", {}).get("source_uploader_department"))
+            if (any(entry.get(field) and entry[field] != previous[field] for field in fields)
+                    or position and position not in {label(previous["role_name"]), declared}
+                    or department and department not in {label(previous["department"]), declared_department}):
+                raise ValueError("uploader_role_conflict")
+            return {**entry, **{field: previous[field] for field in fields}}
+        if previous is not None:
+            # A historically unassigned source remains unassigned; a new alias
+            # is not authority to migrate its existing membership.
+            if entry.get("role_id") or entry.get("role_name"):
+                raise ValueError("uploader_role_conflict")
+            return entry
+        # Shared MCP credentials are transport identities, never employee defaults.
+        # Trusted item/alias assignments are applied by the receipt worker before import.
+        if entry.get("role_id") or entry.get("role_name"):
+            return entry
+        if not position:
+            return entry
+        roles = [dict(row) for row in connection.execute("SELECT role_id,department,name FROM knowledge_roles")]
+        matches = [role for role in roles if label(role["name"]) == position]
+        if not matches:
+            code = "uploader_position_is_department" if any(label(role["department"]) == position for role in roles) else "uploader_role_not_found"
+            raise ValueError(code)
+        if department:
+            matches = [role for role in matches if label(role["department"]) == department]
+            if not matches:
+                raise ValueError("uploader_department_mismatch")
+        if len(matches) != 1:
+            raise ValueError("uploader_role_ambiguous")
+        role = matches[0]
+        return {**entry, "role_id": role["role_id"], "department": role["department"], "role_name": role["name"]}
+
+    def roles(self):
+        with self._connection() as connection:
+            if not self._roles_ready(connection):
+                return []
+            roles = [dict(row) for row in connection.execute("SELECT role_id,department,name FROM knowledge_roles ORDER BY department,name,role_id")]
+        counts = {role["role_id"]: {"sop": 0, "skill": 0, "other": 0} for role in roles}
+        for item in self.published_catalog():
+            if item.get("role_id") in counts:
+                counts[item["role_id"]][knowledge_category(item)] += 1
+        return [{**role, "counts": counts[role["role_id"]], "total": sum(counts[role["role_id"]].values())} for role in roles]
 
     def _execute(self, connection, sql, parameters=()):
         # All SQL here is static and contains no literal question marks.
@@ -279,7 +446,7 @@ class KnowledgeStore:
     def import_draft(self, entry: dict, *, allow_new_revision: bool = True) -> dict:
         if type(allow_new_revision) is not bool:
             raise ValueError("allow_new_revision must be a boolean")
-        payload = normalize_entry(entry)
+        payload = normalize_entry(self.bind_role(normalize_entry(entry), create_from_sop=True))
         knowledge_id = payload["knowledge_id"]
         payload_hash = payload["payload_hash"]
         ref = None
@@ -308,6 +475,9 @@ class KnowledgeStore:
         asset = self._execute(connection, "SELECT * FROM knowledge_assets WHERE knowledge_id = ?", (knowledge_id,)).fetchone()
         if asset:
             latest = self._record(connection, knowledge_id, asset["latest_revision"], hydrate=False)
+            if (latest.get("evidence", {}).get("ingestion_source", "legacy")
+                    != payload.get("evidence", {}).get("ingestion_source", "legacy")):
+                raise ValueError("source_ingestion_source_conflict")
             if latest["payload_hash"] == payload_hash:
                 latest.pop("content_ref", None)
                 return {**latest, "content": payload["content"], "generation": asset["generation"]}
@@ -477,6 +647,8 @@ class KnowledgeStore:
                     "kind": record.get("kind", "未知"), "source_type": evidence.get("source_type"),
                     "scenarios": record.get("scenarios", []),
                     "uploader_position": _uploader_position(record, receipts),
+                    "role_id": record.get("role_id"), "department": record.get("department"),
+                    "role_name": record.get("role_name"), "category": knowledge_category(record),
                     "related_knowledge_ids": sorted({item["knowledge_id"] for item in related
                         if isinstance(item, dict) and isinstance(item.get("knowledge_id"), str)})
                         if isinstance(related, list) else [],
@@ -516,6 +688,56 @@ class KnowledgeStore:
                 })
             return result
 
+    def _graph_features_ready(self, connection):
+        if connection is None:
+            return False
+        if self.database_url:
+            row = connection.execute("""SELECT cache.relnamespace=assets.relnamespace AS ready
+                FROM pg_class cache JOIN pg_class assets ON assets.oid=to_regclass('knowledge_assets')
+                WHERE cache.oid=to_regclass('knowledge_graph_features')""").fetchone()
+            return bool(row and row["ready"])
+        return connection.execute("SELECT 1 FROM sqlite_master WHERE name='knowledge_graph_features'").fetchone() is not None
+
+    def graph_features(self, algorithm_version, *, limit=1000):
+        """Load only derived features for current publications; never hydrate bodies."""
+        with self._connection() as connection:
+            if not self._graph_features_ready(connection):
+                return []
+            rows = self._execute(connection, """SELECT f.* FROM knowledge_graph_features f
+                JOIN knowledge_assets a ON a.knowledge_id=f.knowledge_id
+                AND a.published_revision=f.revision AND a.published_at=f.published_at
+                WHERE f.algorithm_version=? ORDER BY a.published_at DESC,a.knowledge_id LIMIT ?""",
+                (algorithm_version, limit))
+            return [dict(row) for row in rows]
+
+    def save_graph_features(self, record, algorithm_version, features):
+        """A cache writer cannot replace a newer publication's features."""
+        # Legacy catalogues stay read-only until explicit initialization on PG.
+        # In particular a graph request must not initialize a missing table.
+        with self._connection() as connection:
+            if not self._graph_features_ready(connection):
+                return False
+        encoded = _json(features)
+        with self._connection(write=True) as connection:
+            if not self._graph_features_ready(connection):
+                return False
+            self._lock(connection, record["knowledge_id"])
+            asset = self._asset(connection, record["knowledge_id"])
+            if (asset["published_revision"] != record["revision"]
+                    or asset["published_at"] != record["published_at"]):
+                return False
+            current = self._record(connection, record["knowledge_id"], record["revision"], hydrate=False)
+            if current["content_hash"] != record["content_hash"]:
+                return False
+            self._execute(connection, """INSERT INTO knowledge_graph_features
+                (knowledge_id,algorithm_version,revision,content_hash,published_at,features_json)
+                VALUES (?,?,?,?,?,?) ON CONFLICT (knowledge_id,algorithm_version) DO UPDATE SET
+                revision=excluded.revision,content_hash=excluded.content_hash,
+                published_at=excluded.published_at,features_json=excluded.features_json""",
+                (record["knowledge_id"], algorithm_version, record["revision"], record["content_hash"],
+                 record["published_at"], encoded))
+            return True
+
     def list_assets(self) -> list[dict]:
         with self._connection() as connection:
             if connection is None:
@@ -529,18 +751,20 @@ class KnowledgeStore:
                 })
             return result
 
-    def published_revisions(self, department=None, scenario=None) -> list[dict]:
-        filters = {"department": department, "scenario": scenario}
+    def published_revisions(self, department=None, scenario=None, role_id=None, category=None) -> list[dict]:
+        filters = {"department": department, "scenario": scenario, "role_id": role_id, "category": category}
         for name, value in filters.items():
             if value is not None:
                 filters[name] = _text(value, name)
                 if len(filters[name]) > 200:
                     raise ValueError(f"{name} exceeds the 200-character limit")
+        if role_id is not None and role_id != "unknown":
+            validate_role_id(role_id)
+        if category is not None and category not in {"sop", "skill", "other"}:
+            raise ValueError("invalid_knowledge_category")
         with self._connection() as connection:
             if connection is None:
                 return []
-            if all(value is None for value in filters.values()):
-                return [dict(row) for row in connection.execute("SELECT knowledge_id, published_revision AS revision FROM knowledge_assets WHERE published_revision IS NOT NULL ORDER BY knowledge_id")]
             rows = connection.execute("""SELECT a.knowledge_id, a.published_revision AS revision, r.record_json
                 FROM knowledge_assets a JOIN knowledge_revisions r ON a.knowledge_id = r.knowledge_id
                 AND a.published_revision = r.revision ORDER BY a.knowledge_id""")
@@ -551,5 +775,13 @@ class KnowledgeStore:
                     continue
                 if filters["scenario"] is not None and filters["scenario"] not in metadata.get("scenarios", []):
                     continue
-                result.append({"knowledge_id": row["knowledge_id"], "revision": row["revision"]})
+                if role_id is not None and (metadata.get("role_id") or "unknown") != role_id:
+                    continue
+                if category is not None and knowledge_category(metadata) != category:
+                    continue
+                item = {"knowledge_id": row["knowledge_id"], "revision": row["revision"]}
+                source = metadata.get("evidence", {}).get("ingestion_source", "legacy")
+                if source != "legacy":
+                    item["ingestion_source"] = source
+                result.append(item)
             return result

@@ -114,13 +114,17 @@ def test_page_keeps_untrusted_data_out_of_html_and_uses_text_dom_sinks():
 
 def test_routes_expose_only_trial_page_catalog_and_read_only_knowledge():
     app = create_app(FakeService(), catalog())
-    assert {(route.path, frozenset(route.methods)) for route in app.routes} == {
+    assert {(path, frozenset(method.upper() for method in operations))
+            for path, operations in app.openapi()["paths"].items()} == {
         ("/", frozenset({"GET"})),
         ("/api/trial/catalog", frozenset({"GET"})),
         ("/api/knowledge/search", frozenset({"POST"})),
         ("/api/knowledge/{knowledge_id}", frozenset({"GET"})),
     }
     with TestClient(app) as client:
+        # Documentation endpoints are not represented in OpenAPI's paths.
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            assert client.get(path).status_code == 404
         for path in ("/docs", "/openapi.json", "/api/rag/search", "/api/rag/answer",
                      "/api/rag/visual-ingest/run", "/api/knowledge/publish", "/api/upload"):
             assert client.post(path, json={}).status_code in (404, 405)

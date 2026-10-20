@@ -12,6 +12,12 @@ def model(monkeypatch):
         def post(url, headers, payload, timeout):
             assert timeout == 18 and payload["enable_thinking"] is False
             assert payload["messages"][0]["role"] == "system"
+            documents = json.loads(payload["messages"][1]["content"])["documents"]
+            for index, document in enumerate(documents):
+                assert document["index"] == index
+                for span_index, span in enumerate(document["spans"]):
+                    assert set(span) == {"span_index", "text"}
+                    assert span["span_index"] == span_index
             return {"choices": [{"finish_reason": finish, "message": {"content": json.dumps(content)}}]}
         monkeypatch.setattr(answer_service, "post_json", post)
     return install
@@ -27,11 +33,18 @@ def test_supported_evidence_and_empty_decision(model):
     assert knowledge_relevance.supported_indices("回档", documents) == {0}
 
 
+def test_document_and_span_indices_are_separate(model):
+    documents = ["标题：长文\n\n" + "甲" * 160 + "乙", "标题：短文\n\n丙"]
+    model({"supported": [{"index": 0, "span_index": 1}, {"index": 1, "span_index": 0}]})
+    assert knowledge_relevance.supported_indices("查询", documents) == {0, 1}
+
+
 @pytest.mark.parametrize("value", [
     {}, {"supported": None}, {"supported": {}, "extra": True},
     {"supported": [{"index": True, "span_index": 0}]},
     {"supported": [{"index": -1, "span_index": 0}]},
     {"supported": [{"index": 1, "span_index": 0}]},
+    {"supported": [{"index": 0, "span_index": 0}, {"index": 1, "span_index": 0}]},
     {"supported": [{"index": 0, "span_index": True}]},
     {"supported": [{"index": 0, "span_index": -1}]},
     {"supported": [{"index": 0, "span_index": 1}]},

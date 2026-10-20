@@ -57,9 +57,11 @@ def test_history_includes_rejected_without_job_and_paginates_per_owner(history):
         all_items.extend(data['items'])
     assert [row['receipt_id'] for row in all_items] == sorted((value for key, value in ids.items() if key.startswith('alice:')), reverse=True)
     assert len({row['receipt_id'] for row in all_items}) == 5
-    expected = {'receipt_id', 'filename', 'byte_length', 'status', 'error_code', 'created_at', 'updated_at', 'content_verified', 'retryable', 'job_id', 'job_status'}
+    expected = {'receipt_id', 'filename', 'byte_length', 'status', 'error_code', 'created_at', 'updated_at', 'content_verified', 'retryable', 'job_id', 'job_status', 'display_title', 'material_count', 'uploader_positions', 'uploader_departments', 'role_assignments', 'role_assignments_total', 'role_assignments_updated_at', 'attention_required', 'counts', 'blocking_reasons', 'blocking_reasons_truncated', 'job_stage', 'job_updated_at'}
     for row in all_items:
         assert set(row) == expected
+        assert row['display_title'] is None and row['material_count'] == 0
+        assert row['uploader_positions'] == [] and row['uploader_departments'] == []
         assert bool(row['job_id']) == (row['status'] == 'verified')
     rejected = client.get(BASE + '/receipts?status=rejected', headers=headers()).json()
     assert rejected['total'] == 1 and rejected['items'][0]['receipt_id'] == ids['alice:rejected']
@@ -127,8 +129,16 @@ def test_history_job_association_matches_owner_and_selects_one_latest_job(histor
                 (job_id,receipt_id,principal,source_id,filename,rule_version,status,stage,created_at,updated_at)
                 VALUES (?,?,?,?,?,?, 'queued','queued',?,?)''',
                 (key, ids['alice:verified'], owner, 'source', 'synthetic.zip', key, created, created))
+            db.execute('''INSERT INTO knowledge_processing_items
+                (item_id,job_id,source_path,title,status,reason_codes,knowledge_id,updated_at)
+                VALUES (?,?,?,?,'draft','[]',?,?)''',
+                (key, key, 'body.md', owner + ' 私有标题', key, created))
     value = store.list_receipts('alice', status='verified')
     assert value['total'] == 1 and len(value['items']) == 1
     assert value['items'][0]['job_id'] == 'c' * 32 != original['job_id']
+    assert value['items'][0]['display_title'] == 'alice 私有标题'
+    assert value['items'][0]['material_count'] == 1
+    assert 'bob 私有标题' not in str(value)
+    assert 'bob 私有标题' not in str(store.list_jobs('alice'))
     with pytest.raises(ProcessingError):
         store.list_receipts('alice', limit=True)

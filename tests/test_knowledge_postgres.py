@@ -13,11 +13,18 @@ from uuid import uuid4
 import pytest
 
 from rag_app.knowledge_store import KnowledgeStore
+from test_knowledge_governance_postgres import governance_postgres
+from test_knowledge_store import MemoryObjects, assert_role_initialization_preserves_existing_catalogue
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.skipif(
     not os.getenv("KNOWLEDGE_TEST_DATABASE_URL"), reason="explicit PostgreSQL test database not configured",
 )]
+
+
+def test_role_initialization_preserves_existing_postgres_catalogue(governance_postgres, capsys):
+    store = KnowledgeStore(database_url=governance_postgres.url, objects=MemoryObjects())
+    assert_role_initialization_preserves_existing_catalogue(store, capsys)
 
 
 def test_postgres_initialization_concurrency_and_withdrawal(monkeypatch):

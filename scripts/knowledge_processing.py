@@ -18,6 +18,12 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     initialize = commands.add_parser("init-db")
     initialize.add_argument("--execute", action="store_true")
+    for name in ("init-role-assignments", "migrate-role-assignments"):
+        migration = commands.add_parser(name)
+        migration.add_argument("--execute", action="store_true", help="Apply the reviewed incremental migration; default is read-only preview.")
+    review = commands.add_parser("review-published-roles", help="Read-only candidate report; never reassign published knowledge.")
+    review.add_argument("--limit", type=int, default=100)
+    review.add_argument("--offset", type=int, default=0)
     worker = commands.add_parser("work")
     mode = worker.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
@@ -28,6 +34,25 @@ def main(argv=None):
                           "additive_item_columns": ["version", "resolution_json", "publication_json"], "rewrite_existing_revisions": False}))
         return 0
     try:
+        if args.command in {"init-role-assignments", "migrate-role-assignments", "review-published-roles"}:
+            if ((args.sqlite is not None and not args.sqlite.is_file())
+                    or args.sqlite is None and not os.getenv("KNOWLEDGE_DATABASE_URL")):
+                print(json.dumps({"ok": False, "error_code": "explicit_existing_database_required"}))
+                return 1
+            store = ProcessingStore(args.sqlite)
+            if args.command == "review-published-roles":
+                if not 1 <= args.limit <= 1000 or not 0 <= args.offset <= 1_000_000:
+                    print(json.dumps({"ok": False, "error_code": "invalid_review_page"}))
+                    return 1
+                from rag_app.knowledge_role_maintenance import review_published_role_assignments
+                result = review_published_role_assignments(store, limit=args.limit, offset=args.offset)
+                print(json.dumps({"ok": True, "status": "read_only", **result}, ensure_ascii=False))
+                return 0
+            method = (store.initialize_role_assignments if args.command == "init-role-assignments"
+                      else store.migrate_legacy_item_roles)
+            result = method(apply=args.execute)
+            print(json.dumps({"ok": True, "status": "applied" if args.execute else "dry_run", **result}, ensure_ascii=False))
+            return 0
         store = ProcessingStore(args.sqlite)
         if args.command == "init-db":
             store.initialize()

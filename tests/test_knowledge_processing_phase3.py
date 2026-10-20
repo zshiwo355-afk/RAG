@@ -103,6 +103,7 @@ def test_uploader_position_uses_authenticated_receipt_not_audience(system, monke
     from test_knowledge_processing_api import BASE, READ, TOKEN, headers
 
     index = enable(system)
+    system.catalogue.register_role('产品部', '产品经理')
     receipt = intake(system, package(**{'上传员工岗位': '产品经理', '使用对象': '销售'}))
     assert system.service.run_once()
     item = asset_item(receipt_job(system, receipt))
@@ -158,28 +159,36 @@ def test_legacy_or_missing_uploader_position_remains_unknown(system, position):
 
 def test_position_changes_and_other_uploaders_do_not_rewrite_duplicate_attribution(system):
     index = enable(system)
+    system.catalogue.register_role('产品部', '产品经理')
     first = intake(system, package(**{'上传员工岗位': '产品经理'}))
     assert system.service.run_once()
     original = asset_item(receipt_job(system, first))
-    for principal, position in [('user:a', '研发'), ('user:b', '运营')]:
-        receipt = intake(system, package(**{'上传员工岗位': position}), principal=principal)
+    changed = intake(system, package(**{'上传员工岗位': '研发'}))
+    assert system.service.run_once()
+    conflict = asset_item(receipt_job(system, changed))
+    assert conflict['status'] == 'needs_review' and conflict['reason_codes'] == ['source_relation_review']
+    for principal in ('user:a', 'user:b'):
+        receipt = intake(system, package(**{'上传员工岗位': '产品经理'}), principal=principal)
         assert system.service.run_once()
         item = asset_item(receipt_job(system, receipt))
         assert item['status'] == 'duplicate' and item['revision'] == 1
         assert item['knowledge_id'] == original['knowledge_id']
     assert len(index.calls) == 1 and system.catalogue.published_count() == 1
     assert system.catalogue.published_catalog()[0]['uploader_position'] == '产品经理'
+    assert system.catalogue.get_published(original['knowledge_id'])['evidence']['uploader_attribution']['receipt_id'] == first['receipt_id']
 
 
 def test_new_private_revision_cannot_change_published_position(system):
     enable(system)
+    system.catalogue.register_role('产品部', '产品经理')
     receipt = intake(system, package(**{'上传员工岗位': '产品经理'}))
     assert system.service.run_once()
     original = asset_item(receipt_job(system, receipt))
     changed = intake(system, package(BODY + '\n新的工作方法。', base=1,
-        **{'上传员工岗位': '研发', '共享范围': '未确认'}))
+        **{'上传员工岗位': '', '共享范围': '未确认'}))
     assert system.service.run_once()
     assert asset_item(receipt_job(system, changed))['revision'] == 2
+    assert 'uploader_attribution' not in system.catalogue.snapshot(original['knowledge_id'], 2)['evidence']
     assert system.catalogue.published_catalog()[0]['uploader_position'] == '产品经理'
     assert system.catalogue.graph_internal_snapshot()[0]['uploader_position'] == '产品经理'
     assert system.catalogue.published_uploader_position(system.catalogue.get_published(original['knowledge_id'])) == '产品经理'
@@ -206,6 +215,7 @@ def test_anonymous_manifest_and_forged_attribution_are_not_trusted(system, tmp_p
     assert legacy.published_catalog()[0]['uploader_position'] is None
 
     enable(system)
+    system.catalogue.register_role('产品部', '产品经理')
     receipt = intake(system, package(**{'上传员工岗位': '产品经理'}))
     assert system.service.run_once()
     original = system.catalogue.get_published(asset_item(receipt_job(system, receipt))['knowledge_id'])
@@ -234,6 +244,7 @@ def legacy_manifest_rejection(system, monkeypatch):
     from rag_app import knowledge_intake
 
     index = enable(system)
+    system.catalogue.register_role('产品部', '产品经理')
     receipt = intake(system, package(**{'上传员工岗位': '产品经理'}))
     with monkeypatch.context() as legacy:
         legacy.setattr(knowledge_intake, 'SOURCE_UPLOADER_COLUMN', '__unsupported_legacy_column__')
@@ -338,6 +349,7 @@ def test_manifest_reparse_cleanup_rolls_back_if_audit_write_fails(system, monkey
 def test_calendar_label_first_delivery_publishes_without_claiming_a_base_revision(system):
     from rag_app.knowledge_service import KnowledgeService
     index = enable(system)
+    system.catalogue.register_role('总经办', 'AI架构师')
     receipt = intake(system, package(base='2026-10', **{'上传员工岗位': 'AI架构师'}))
     assert system.service.run_once()
     item = asset_item(receipt_job(system, receipt))
@@ -352,15 +364,16 @@ def test_calendar_label_first_delivery_publishes_without_claiming_a_base_revisio
 
 def test_calendar_label_update_requires_real_base_and_preserves_publication(system):
     index = enable(system)
+    system.catalogue.register_role('产品部', '产品经理')
     first = intake(system, package(**{'上传员工岗位': '产品经理'}))
     assert system.service.run_once()
     first_item = asset_item(receipt_job(system, first))
     published = system.catalogue.get_published(first_item['knowledge_id'])
-    changed = intake(system, package(BODY + '\n补充资料后必须复核输出。', base='2026-10', **{'上传员工岗位': 'AI架构师'}))
+    changed = intake(system, package(BODY + '\n补充资料后必须复核输出。', base='2026-10', **{'上传员工岗位': '产品经理'}))
     assert system.service.run_once()
     item = asset_item(receipt_job(system, changed))
-    assert item['knowledge_id'] == first_item['knowledge_id'] and item['revision'] == 2
-    assert item['status'] == 'needs_review' and 'source_base_revision_required' in item['reason_codes']
+    assert item['knowledge_id'] is None and item['revision'] is None
+    assert item['status'] == 'needs_review' and 'source_relation_review' in item['reason_codes']
     current = system.catalogue.get_published(first_item['knowledge_id'])
     assert current['revision'] == 1 and current['content_hash'] == published['content_hash']
     assert system.catalogue.published_uploader_position(current) == '产品经理'
@@ -394,6 +407,7 @@ def test_invalid_revision_is_rejected_with_durable_manifest_reason(system, base)
 def legacy_revision_label_rejection(system, monkeypatch):
     from rag_app import knowledge_intake
     index = enable(system)
+    system.catalogue.register_role('总经办', 'AI架构师')
     receipt = intake(system, package(base='2026-10', **{'上传员工岗位': 'AI架构师'}))
     with monkeypatch.context() as legacy:
         legacy.setattr(knowledge_intake, 'SOURCE_UPLOADER_COLUMN', '__unsupported_legacy_column__')
@@ -586,7 +600,7 @@ def test_unordered_update_and_sensitive_delivery_stay_out_of_public_knowledge(sy
     changed = intake(system, package(BODY + '\n修改顺序未知。'))
     system.service.run_once()
     item = asset_item(receipt_job(system, changed))
-    assert item['status'] == 'needs_review' and 'source_base_revision_required' in item['reason_codes']
+    assert item['status'] == 'needs_review' and 'source_relation_review' in item['reason_codes']
     assert system.catalogue.get_published(asset['knowledge_id'])['revision'] == 1
     sensitive = intake(system, package(BODY + '\npassword=private-synthetic-secret\n'), source='different')
     system.service.run_once()
@@ -613,6 +627,79 @@ def test_index_failure_keeps_pointer_and_retry_uses_same_draft(system):
     assert system.catalogue.list_assets()[0]['latest_revision'] == 2
 
 
+@pytest.mark.parametrize('interruption', ['submission', 'indexing', 'published'])
+def test_docx_parser_upgrade_resumes_persisted_submission_without_rewriting_it(system, monkeypatch, interruption):
+    from rag_app import knowledge_text
+    from test_knowledge_text import docx, paragraph, table
+
+    index = enable(system)
+    document = docx(paragraph('岗位标准作业程序') +
+                    table([['所属部门', '总经办', '岗位名称', 'AI架构师']]) +
+                    paragraph('工作方法', 'Heading1') + paragraph('核对输入，保存验证依据。'))
+    # This legacy method is now recognized as an SOP, so the current parser
+    # also reports a category mismatch. Recovery must use the old decision.
+    receipt = intake(system, package(document, **{'正文路径': '正文/方法.docx'}))
+
+    def old_docx(archive, issues):
+        # The pre-role parser emitted plain paragraphs, including Word headings.
+        body = knowledge_text.ET.fromstring(archive.read('word/document.xml')).find(knowledge_text.W + 'body')
+        paragraph_number = table_number = 0
+        for block in body:
+            if block.tag == knowledge_text.W + 'p':
+                paragraph_number += 1
+                yield knowledge_text._paragraph(block), {'kind': 'paragraph', 'paragraph': paragraph_number}
+            else:
+                assert block.tag == knowledge_text.W + 'tbl'
+                table_number += 1
+                for number, cells in enumerate(knowledge_text._table_rows(block), 1):
+                    yield '[表格 %d 行 %d] %s' % (table_number, number, json.dumps(cells, ensure_ascii=False)), {
+                        'kind': 'table_row', 'table': table_number, 'row': number}
+
+    def interrupted(*args, **kwargs):
+        raise RuntimeError('synthetic interruption after durable submission')
+
+    with monkeypatch.context() as old_worker:
+        old_worker.setattr(knowledge_text, '_docx', old_docx)
+        old_worker.setattr(knowledge_text, '_sop_metadata', lambda archive: None)
+        if interruption == 'submission':
+            old_worker.setattr(system.store, 'save_item', interrupted)
+        elif interruption == 'indexing':
+            index.failure = RuntimeError('synthetic index unavailable')
+        else:
+            finish = system.store.finish
+            old_worker.setattr(system.store, 'finish', lambda row, status, code=None:
+                                interrupted() if status == 'completed' else finish(row, status, code))
+        assert system.service.run_once()
+
+    before = receipt_job(system, receipt)
+    assert before['status'] == 'queued'
+    with system.store._connection() as connection:
+        submission = dict(connection.execute('SELECT * FROM knowledge_submissions').fetchone())
+        stored = connection.execute('SELECT record_json FROM knowledge_revisions').fetchone()['record_json']
+    old_record = system.catalogue.snapshot(submission['knowledge_id'], submission['revision'])
+    assert old_record['content'] != knowledge_text.parse_text_file('方法.docx', document)['text']
+    if interruption == 'submission':
+        assert before['item_total'] == 0
+    calls = len(index.calls)
+    index.failure = None
+    system.now[0] += 301
+    assert system.service.run_once()
+
+    after = receipt_job(system, receipt)
+    assert after['status'] == 'completed', after
+    assert after['counts']['published'] == 1
+    record = system.catalogue.get_published(submission['knowledge_id'])
+    assert record['content'] == old_record['content']
+    assert record['payload_hash'] == old_record['payload_hash']
+    assert 'role_id' not in record and 'files' not in record
+    assert system.catalogue.roles() == []
+    assert len(index.calls) == calls + (interruption != 'published')
+    with system.store._connection() as connection:
+        assert dict(connection.execute('SELECT * FROM knowledge_submissions').fetchone()) == submission
+        assert connection.execute('SELECT COUNT(*) FROM knowledge_revisions').fetchone()[0] == 1
+        assert connection.execute('SELECT record_json FROM knowledge_revisions').fetchone()['record_json'] == stored
+
+
 def test_plain_chat_is_retained_for_review_when_automatic_publication_enabled(system):
     index = enable(system)
     submit(system)
@@ -621,6 +708,109 @@ def test_plain_chat_is_retained_for_review_when_automatic_publication_enabled(sy
     assert item['status'] == 'needs_review'
     assert 'structured_delivery_required' in item['reason_codes']
     assert not index.calls and system.catalogue.published_count() == 0
+
+
+@pytest.mark.parametrize('change', ['withdraw', 'newer_revision'])
+def test_resumed_submission_keeps_original_publication_pin(system, change):
+    index = enable(system)
+    first = intake(system)
+    system.service.run_once()
+    original = asset_item(receipt_job(system, first))
+    index.failure = RuntimeError('synthetic index unavailable')
+    pending = intake(system, package(BODY + '\n旧任务的修订。', base=1))
+    system.service.run_once()
+    assert receipt_job(system, pending)['status'] == 'queued'
+    if change == 'withdraw':
+        system.catalogue.withdraw(original['knowledge_id'])
+    else:
+        draft = system.catalogue.import_draft({**system.catalogue.snapshot(original['knowledge_id']),
+            'content': BODY + '\n后续显式确认的修订。'})
+        system.catalogue.publish(draft['knowledge_id'], draft['revision'],
+                                 expected_generation=draft['generation'], confirmed_by='test')
+    before = system.catalogue.get_published(original['knowledge_id'])
+    calls = len(index.calls)
+    index.failure = None
+    system.now[0] += 301
+    system.service.run_once()
+    result = receipt_job(system, pending)
+    assert result['status'] == 'needs_review'
+    assert asset_item(result)['reason_codes'] == ['publication_version_conflict']
+    assert system.catalogue.get_published(original['knowledge_id']) == before
+    assert len(index.calls) == calls
+
+
+@pytest.mark.parametrize('identity', ['candidate_id', 'knowledge_id'])
+def test_parser_identity_change_requires_review_before_any_new_import(system, monkeypatch, identity):
+    from rag_app import knowledge_processing
+    index = enable(system)
+    index.failure = RuntimeError('synthetic index unavailable')
+    receipt = intake(system)
+    system.service.run_once()
+    with system.store._connection() as connection:
+        original_submission = dict(connection.execute('SELECT * FROM knowledge_submissions').fetchone())
+        original_record = connection.execute('SELECT record_json FROM knowledge_revisions').fetchone()[0]
+    parse = knowledge_processing.process_batch
+
+    def changed_candidates(*args, **kwargs):
+        batch = parse(*args, **kwargs)
+        # Models a parser changing derived case boundaries or source membership.
+        batch['assets'][0][identity] += '_changed'
+        return batch
+
+    monkeypatch.setattr(knowledge_processing, 'process_batch', changed_candidates)
+    index.failure = None
+    calls = len(index.calls)
+    system.now[0] += 301
+    system.service.run_once()
+    after = receipt_job(system, receipt)
+    assert after['status'] == 'needs_review', after
+    assert after['error_code'] in {'processing_source_identity_changed', 'processing_submission_mismatch'}
+    assert len(index.calls) == calls and system.catalogue.published_count() == 0
+    with system.store._connection() as connection:
+        assert list(map(dict, connection.execute('SELECT * FROM knowledge_submissions'))) == [original_submission]
+        assert [row[0] for row in connection.execute('SELECT record_json FROM knowledge_revisions')] == [original_record]
+
+
+def test_resume_missing_old_rule_decision_is_review_only(system, monkeypatch):
+    from rag_app.knowledge_governance import GovernanceStore
+    index = enable(system)
+    index.failure = RuntimeError('synthetic index unavailable')
+    receipt = intake(system)
+    original = GovernanceStore.import_asset
+
+    def legacy_import(self, entry, *args, **kwargs):
+        evidence = {key: value for key, value in entry['evidence'].items() if key != 'automatic_rule_reasons'}
+        return original(self, {**entry, 'evidence': evidence}, *args, **kwargs)
+
+    with monkeypatch.context() as old:
+        old.setattr(GovernanceStore, 'import_asset', legacy_import)
+        system.service.run_once()
+    assert receipt_job(system, receipt)['status'] == 'queued'
+    index.failure = None
+    calls = len(index.calls)
+    system.now[0] += 301
+    system.service.run_once()
+    after = receipt_job(system, receipt)
+    assert after['status'] == 'needs_review'
+    assert asset_item(after)['reason_codes'] == ['processing_decision_unavailable']
+    assert len(index.calls) == calls and system.catalogue.published_count() == 0
+
+
+def test_resume_submission_owner_mismatch_is_reviewed_without_retry_loop(system):
+    index = enable(system)
+    index.failure = RuntimeError('synthetic index unavailable')
+    receipt = intake(system)
+    system.service.run_once()
+    with system.store._connection(write=True) as connection:
+        connection.execute("UPDATE knowledge_submissions SET principal='user:other'")
+    index.failure = None
+    calls = len(index.calls)
+    system.now[0] += 301
+    system.service.run_once()
+    result = receipt_job(system, receipt)
+    assert result['status'] == 'needs_review' and result['error_code'] == 'processing_submission_mismatch'
+    assert len(index.calls) == calls and system.catalogue.published_count() == 0
+    assert not system.service.run_once()
 
 
 def test_completed_legacy_receipts_are_not_reenqueued_or_auto_published(system):
@@ -670,6 +860,323 @@ def test_verified_replacement_is_enqueued_once_and_original_retained(system):
     assert system.service.run_once()
     assert system.catalogue.published_count() == 1
     assert first['object_key'] in system.bucket.data and replacement['object_key'] in system.bucket.data
+
+
+def replacement_package():
+    import zipfile
+    original = package(BODY + '\n[必需的核对清单](missing.md)')
+    with zipfile.ZipFile(io.BytesIO(original)) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    files['正文/missing.md'] = '# 核对清单\n记录来源、验收人和附件完整性。\n'
+    files['独立待核对.png'] = b'synthetic-image'
+    return original, zip_bytes(files)
+
+
+@pytest.mark.parametrize('already_processed', [False, True])
+def test_replacement_links_only_matching_unpublished_source_and_preserves_siblings(system, already_processed):
+    enable(system)
+    original, corrected = replacement_package()
+    receipt = intake(system, original)
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = asset_item(before)
+    assert item['revision'] is None and 'unresolved_reference' in item['reason_codes']
+    with system.store._connection() as connection:
+        identity = connection.execute('SELECT canonical_identity FROM knowledge_item_source_bindings WHERE item_id=?',
+                                      (item['item_id'],)).fetchone()['canonical_identity']
+    replacement = intake(system, corrected)
+    siblings = None
+    if already_processed:
+        assert system.service.run_once()
+        blocked = receipt_job(system, replacement)
+        target = asset_item(blocked)
+        assert target['reason_codes'] == ['source_relation_review'] and target['revision'] is None
+        siblings = [row for row in blocked['items'] if row['item_id'] != target['item_id']]
+    resolved = system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+        action='replace', reason='补齐原资料引用的核对清单', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert system.store.get_job(resolved['replacement_job_id'], None)['status'] == 'queued'
+    if siblings:
+        assert system.store.get_job(resolved['replacement_job_id'], None)['attention_required']
+    assert system.service.run_once()
+    after = receipt_job(system, replacement)
+    repaired = asset_item(after)
+    assert repaired['status'] == 'published' and repaired['revision'] == 1
+    with system.store._connection() as connection:
+        assert connection.execute('SELECT canonical_identity FROM knowledge_item_source_bindings WHERE item_id=?',
+                                  (repaired['item_id'],)).fetchone()['canonical_identity'] == identity
+    if siblings is not None:
+        assert [row for row in after['items'] if row['item_id'] != repaired['item_id']] == siblings
+    assert asset_item(receipt_job(system, receipt))['status'] == 'archived'
+    assert system.bucket.data[receipt['object_key']] == original
+    assert system.bucket.data[replacement['object_key']] == corrected
+
+
+def test_replacement_rejects_running_target_before_archiving_original(system):
+    enable(system)
+    original, corrected = replacement_package()
+    receipt = intake(system, original)
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = asset_item(before)
+    replacement = intake(system, corrected)
+    assert system.store.enqueue_verified() == 1
+    claimed = system.store.claim()
+    assert claimed['receipt_id'] == replacement['receipt_id']
+    with pytest.raises(ProcessingError, match='processing_resolution_conflict'):
+        system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+            action='replace', reason='等待补件检查完成', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert receipt_job(system, receipt) == before
+    assert system.store.get_job(claimed['job_id'], None)['status'] == 'running'
+
+
+def test_replacement_relation_does_not_guess_a_draft_revision_baseline(system):
+    enable(system)
+    receipt = intake(system, package(**{'共享范围': ''}))
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = asset_item(before)
+    assert item['revision'] == 1
+    replacement = intake(system, package(BODY + '\n补齐复用信息。'))
+    system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+        action='replace', reason='重新提交补充资料', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert system.service.run_once()
+    blocked = asset_item(receipt_job(system, replacement))
+    assert blocked['status'] == 'needs_review' and 'source_base_revision_required' in blocked['reason_codes']
+    assert system.catalogue.published_count() == 0
+
+
+@pytest.mark.parametrize('interruption', ['indexing', 'finish'])
+def test_replacement_retry_keeps_exact_target_until_terminal_commit(system, monkeypatch, interruption):
+    index = enable(system)
+    original, corrected = replacement_package()
+    receipt = intake(system, original)
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = asset_item(before)
+    replacement = intake(system, corrected)
+    assert system.service.run_once()
+    blocked = receipt_job(system, replacement)
+    target = asset_item(blocked)
+    siblings = [row for row in blocked['items'] if row['item_id'] != target['item_id']]
+    system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+        action='replace', reason='核对补件关系', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    finish = system.store.finish
+    failures = []
+    def interrupted(row, status, code=None):
+        if status == 'needs_review' and not failures:
+            failures.append(True)
+            raise RuntimeError('synthetic interruption before terminal commit')
+        return finish(row, status, code)
+    if interruption == 'indexing':
+        index.failure = RuntimeError('synthetic index failure')
+    else:
+        monkeypatch.setattr(system.store, 'finish', interrupted)
+    assert system.service.run_once()
+    retrying = receipt_job(system, replacement)
+    assert retrying['status'] == 'queued' and retrying['attention_required']
+    raw = system.store.item_record(blocked['job_id'], target['item_id'], None)
+    assert json.loads(raw['repair_json'])['replacement_recheck']
+    assert [row for row in retrying['items'] if row['item_id'] != target['item_id']] == siblings
+    index.failure = None
+    system.now[0] += 31
+    assert system.service.run_once()
+    after = receipt_job(system, replacement)
+    assert asset_item(after)['status'] == 'published' and after['status'] == 'needs_review'
+    assert [row for row in after['items'] if row['item_id'] != target['item_id']] == siblings
+    raw = system.store.item_record(blocked['job_id'], target['item_id'], None)
+    assert 'replacement_recheck' not in json.loads(raw['repair_json'])
+    assert len(index.calls) == (2 if interruption == 'indexing' else 1)
+
+
+def test_replacement_cannot_rebind_target_with_existing_revision(system):
+    enable(system)
+    receipt = intake(system, package(**{'共享范围': ''}))
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = asset_item(before)
+    replacement = intake(system, package(BODY + '\n仍待核验共享范围。', base=1, **{'共享范围': ''}))
+    assert system.service.run_once()
+    target_before = receipt_job(system, replacement)
+    assert asset_item(target_before)['revision'] == 2
+    with pytest.raises(ProcessingError, match='processing_resolution_conflict'):
+        system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+            action='replace', reason='不得重新绑定已有修订', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert receipt_job(system, receipt) == before
+    assert receipt_job(system, replacement) == target_before
+    assert system.catalogue.published_count() == 0
+
+
+@pytest.mark.parametrize('remaining_issue', [False, True])
+def test_replacement_does_not_match_a_different_parser_identity(system, remaining_issue):
+    import zipfile
+    enable(system)
+    original, corrected = replacement_package()
+    receipt = intake(system, original)
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = asset_item(before)
+    with zipfile.ZipFile(io.BytesIO(corrected)) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    if not remaining_issue:
+        files.pop('独立待核对.png')
+    files['交付清单.csv'] = files['交付清单.csv'].replace(b'WORK-001', b'WORK-002')
+    replacement = intake(system, zip_bytes(files))
+    assert system.service.run_once()
+    target_before = receipt_job(system, replacement)
+    assert asset_item(target_before)['status'] == 'published'
+    assert target_before['status'] == ('needs_review' if remaining_issue else 'completed')
+    with pytest.raises(ProcessingError, match='processing_resolution_conflict'):
+        system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+            action='replace', reason='同一收件来源不代表同一资料', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert receipt_job(system, receipt) == before
+    assert receipt_job(system, replacement) == target_before
+
+
+@pytest.mark.parametrize('duplicate', [False, True])
+def test_completed_matching_replacement_is_linked_without_requeue_or_catalogue_changes(system, duplicate):
+    enable(system)
+    first = intake(system, package(**{'共享范围': ''}))
+    assert system.service.run_once()
+    before = receipt_job(system, first)
+    item = asset_item(before)
+    replacement = intake(system, package(base=1))
+    assert system.service.run_once()
+    if duplicate:
+        replacement = intake(system, package(base=1))
+        assert system.service.run_once()
+    target_before = receipt_job(system, replacement)
+    assert target_before['status'] == 'completed'
+    target = asset_item(target_before)
+    assert target['status'] == ('duplicate' if duplicate else 'published')
+    published = system.catalogue.get_published(target['knowledge_id'])
+    resolved = system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+        action='replace', reason='关联已完成的准确补件', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert resolved['replacement_job_id'] == target_before['job_id'] and resolved['status'] == 'archived'
+    assert receipt_job(system, replacement) == target_before
+    assert system.catalogue.get_published(target['knowledge_id']) == published
+    assert not system.service.run_once()
+
+
+def test_completed_replacement_cannot_link_a_source_explicitly_split_as_new(system):
+    enable(system)
+    role = system.catalogue.register_role('品牌部', '设计师')
+    first = intake(system, package(BODY + '\n[必需的清单](missing.md)'))
+    assert system.service.run_once()
+    before = receipt_job(system, first)
+    item = asset_item(before)
+    replacement = intake(system, package())
+    assert system.service.run_once()
+    target_before = receipt_job(system, replacement)
+    target = asset_item(target_before)
+    system.store.set_item_uploader_role(target_before['job_id'], target['item_id'], role['role_id'], 0,
+        actor='reviewer', source_action='new')
+    assert system.service.run_once()
+    target_before = receipt_job(system, replacement)
+    assert target_before['status'] == 'completed'
+    target = asset_item(target_before)
+    published = system.catalogue.get_published(target['knowledge_id'])
+    with pytest.raises(ProcessingError, match='processing_resolution_conflict'):
+        system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+            action='replace', reason='不得关联已经拆分的新资料', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert receipt_job(system, first) == before
+    assert receipt_job(system, replacement) == target_before
+    assert system.catalogue.get_published(target['knowledge_id']) == published
+
+
+def test_replacement_rejects_original_with_publication_proof(system):
+    enable(system)
+    receipt = intake(system, package())
+    assert system.service.run_once()
+    published = asset_item(receipt_job(system, receipt))
+    original = system.catalogue.get_published(published['knowledge_id'])
+    with system.store._connection(write=True) as connection:
+        connection.execute("UPDATE knowledge_processing_items SET status='needs_review' WHERE item_id=?", (published['item_id'],))
+        connection.execute("UPDATE knowledge_processing_jobs SET status='needs_review' WHERE receipt_id=?", (receipt['receipt_id'],))
+    before = receipt_job(system, receipt)
+    replacement = intake(system, package(BODY + '\n待核实的补充。'))
+    with pytest.raises(ProcessingError, match='processing_resolution_conflict'):
+        system.store.resolve(before['job_id'], published['item_id'], None, expected_version=published['version'],
+            action='replace', reason='不能以补件重写已发布原条目', replacement_receipt_id=replacement['receipt_id'], actor='reviewer')
+    assert receipt_job(system, receipt) == before
+    assert system.catalogue.get_published(published['knowledge_id']) == original
+
+
+@pytest.mark.parametrize('status', ['needs_review', 'failed'])
+@pytest.mark.parametrize('action', ['archive', 'replace'])
+def test_last_review_resolution_closes_attention_and_preserves_history(system, status, action):
+    enable(system)
+    published_receipt = intake(system, source='published:protected')
+    assert system.service.run_once()
+    published = asset_item(receipt_job(system, published_receipt))
+    original = system.catalogue.get_published(published['knowledge_id'])
+    receipt = intake(system, package(**{'共享范围': ''}))
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = asset_item(before)
+    replacement = intake(system, package(base=1)) if action == 'replace' else None
+    with system.store._connection(write=True) as connection:
+        connection.execute("UPDATE knowledge_processing_jobs SET status=?,stage=?,error_code='processing_unavailable' WHERE job_id=?",
+                           (status, status, before['job_id']))
+        protected = {table: [dict(row) for row in connection.execute('SELECT * FROM ' + table)]
+                     for table in ('knowledge_assets', 'knowledge_revisions', 'knowledge_submissions')}
+    original_receipt = system.receipts.get(receipt['principal'], receipt['receipt_id'])
+    original_objects = dict(system.bucket.data)
+    resolved = system.store.resolve(before['job_id'], item['item_id'], None,
+        expected_version=item['version'], action=action, reason='资料不合格，保留原件与处理记录',
+        replacement_receipt_id=replacement['receipt_id'] if replacement else None, actor='reviewer')
+    after = receipt_job(system, receipt)
+    assert after['status'] == after['stage'] == 'completed' and after['error_code'] is None
+    assert not after['attention_required'] and after['blocking_reasons'] == []
+    assert system.store.list_jobs(None, status='attention')['total'] == 0
+    assert system.store.stats(None)['attention_jobs'] == 0
+    assert resolved['status'] == 'archived' and resolved['version'] == item['version'] + 1
+    assert system.receipts.get(receipt['principal'], receipt['receipt_id']) == original_receipt
+    assert system.bucket.data == original_objects
+    assert system.catalogue.get_published(published['knowledge_id']) == original
+    with system.store._connection() as connection:
+        assert {table: [dict(row) for row in connection.execute('SELECT * FROM ' + table)]
+                for table in protected} == protected
+    assert any(row['job_id'] == before['job_id'] for row in system.store.list_receipts(None)['items'])
+    assert {event['event_id'] for event in before['events']} <= {event['event_id'] for event in after['events']}
+    assert any(event['event_type'] == 'item_resolved' for event in after['events'])
+    if replacement:
+        assert resolved['replacement_receipt_id'] == replacement['receipt_id']
+        assert system.store.get_job(resolved['replacement_job_id'], None)['status'] == 'queued'
+        assert system.store.enqueue_verified() == 0
+
+
+@pytest.mark.parametrize('sibling_status', ['needs_review', 'indexing'])
+def test_failed_resolution_keeps_unfinished_sibling_in_attention(system, sibling_status):
+    receipt = intake(system, zip_bytes({'first.png': b'first', 'second.png': b'second'}))
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item, sibling = before['items']
+    with system.store._connection(write=True) as connection:
+        connection.execute("UPDATE knowledge_processing_jobs SET status='failed',stage='failed',error_code='processing_unavailable' WHERE job_id=?",
+                           (before['job_id'],))
+        connection.execute("UPDATE knowledge_processing_items SET status=? WHERE item_id=?", (sibling_status, sibling['item_id']))
+    sibling_before = system.store.item_record(before['job_id'], sibling['item_id'], None)
+    system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+                         action='archive', reason='保留此原件，其他条目继续处理', actor='reviewer')
+    after = receipt_job(system, receipt)
+    assert after['status'] == 'failed' and after['error_code'] == 'processing_unavailable'
+    assert after['attention_required'] and system.store.list_jobs(None, status='attention')['total'] == 1
+    assert system.store.item_record(before['job_id'], sibling['item_id'], None) == sibling_before
+
+
+@pytest.mark.parametrize('status', ['queued', 'running'])
+def test_resolution_cannot_close_active_job(system, status):
+    receipt = intake(system, zip_bytes({'image.png': b'synthetic-image'}))
+    assert system.service.run_once()
+    before = receipt_job(system, receipt)
+    item = before['items'][0]
+    with system.store._connection(write=True) as connection:
+        connection.execute("UPDATE knowledge_processing_jobs SET status=?,stage=? WHERE job_id=?", (status, status, before['job_id']))
+    current = receipt_job(system, receipt)
+    with pytest.raises(ProcessingError, match='processing_resolution_conflict'):
+        system.store.resolve(before['job_id'], item['item_id'], None, expected_version=item['version'],
+                             action='archive', reason='不能处理运行中的条目', actor='reviewer')
+    assert receipt_job(system, receipt) == current
 
 
 def test_publication_commit_survives_job_finish_failure_without_republishing(system, monkeypatch):

@@ -32,6 +32,7 @@ from .visual_ingest_api import chunk_text
 
 TABLE_NAME = "company_knowledge"
 HYBRID_TABLE_NAME = "company_knowledge_hybrid"
+COLLECTOR_TABLE_NAME = "company_knowledge_bt"
 VECTOR_FIELD = "source_text_vector"
 VECTOR_DIMENSIONS = 1024
 MAX_TITLE_CHARS = 240
@@ -147,11 +148,24 @@ def _check_body(response: Any, *, write: bool = False) -> None:
 
 
 class KnowledgeIndex:
-    def __init__(self) -> None:
+    def __init__(self, *, ingestion_source="legacy") -> None:
+        if not isinstance(ingestion_source, str) or ingestion_source not in {"legacy", "agent_collector"}:
+            raise ValueError("invalid knowledge ingestion source")
+        self.ingestion_source = ingestion_source
+        self._other_index = None
         self.client = None
         self.models = None
         self.table = ""
         self.instance_id = ""
+
+    def _index_for_source(self, source: str) -> KnowledgeIndex:
+        if not isinstance(source, str) or source not in {"legacy", "agent_collector"}:
+            raise KnowledgeIndexError("invalid knowledge ingestion source")
+        if source == self.ingestion_source:
+            return self
+        if self._other_index is None:
+            self._other_index = KnowledgeIndex(ingestion_source=source)
+        return self._other_index
 
     def _connect(self) -> None:
         if self.client is not None:
@@ -169,9 +183,10 @@ class KnowledgeIndex:
                     or url.password or url.query or url.fragment or url.path not in ("", "/")
                     or any(char.isspace() for char in endpoint)):
                 raise ValueError("invalid configuration")
-            table = os.getenv("KNOWLEDGE_TABLE", TABLE_NAME).strip()
-            if table not in (TABLE_NAME, HYBRID_TABLE_NAME,
-                             f"{instance}_{TABLE_NAME}", f"{instance}_{HYBRID_TABLE_NAME}"):
+            names = (COLLECTOR_TABLE_NAME,) if self.ingestion_source == "agent_collector" else (TABLE_NAME, HYBRID_TABLE_NAME)
+            table = (os.getenv("KNOWLEDGE_COLLECTOR_TABLE", COLLECTOR_TABLE_NAME) if self.ingestion_source == "agent_collector"
+                     else os.getenv("KNOWLEDGE_TABLE", TABLE_NAME)).strip()
+            if table not in (*names, *(f"{instance}_{name}" for name in names)):
                 raise ValueError("invalid knowledge table")
             client, models = create_client(config)
             from alibabacloud_tea_util.models import RuntimeOptions
@@ -186,9 +201,11 @@ class KnowledgeIndex:
             raise KnowledgeIndexError("invalid or unavailable company knowledge cloud configuration") from None
 
     def _datasource(self) -> str:
-        source = os.getenv("KNOWLEDGE_PUSH_DATASOURCE", "").strip()
+        source = os.getenv("KNOWLEDGE_COLLECTOR_PUSH_DATASOURCE" if self.ingestion_source == "agent_collector"
+                           else "KNOWLEDGE_PUSH_DATASOURCE", "").strip()
         target = self.table.removeprefix(f"{self.instance_id}_")
-        if target not in (TABLE_NAME, HYBRID_TABLE_NAME) or source not in (target, f"{self.instance_id}_{target}"):
+        names = (COLLECTOR_TABLE_NAME,) if self.ingestion_source == "agent_collector" else (TABLE_NAME, HYBRID_TABLE_NAME)
+        if target not in names or source not in (target, f"{self.instance_id}_{target}"):
             raise KnowledgeIndexError("KNOWLEDGE_PUSH_DATASOURCE must explicitly name the company knowledge data source")
         return source
 
@@ -242,6 +259,9 @@ class KnowledgeIndex:
     def index_and_verify(self, record: dict[str, Any], *, require_keyword: bool = False) -> dict[str, Any]:
         if type(require_keyword) is not bool:
             raise ValueError("require_keyword must be a boolean")
+        target = self._index_for_source(record.get("evidence", {}).get("ingestion_source", "legacy"))
+        if target is not self:
+            return target.index_and_verify(record, require_keyword=require_keyword)
         chunks = chunk_document(record)
         self._connect()
         data_source = self._datasource()
@@ -326,18 +346,30 @@ class KnowledgeIndex:
             raise ValueError("query must contain 1 to 4000 characters")
         if type(top_k) is not int or not 1 <= top_k <= 200:
             raise ValueError("top_k must be between 1 and 200")
-        identities = [_identity(record) for record in allowed_versions]
-        allowed = {key: (knowledge_id, revision) for knowledge_id, revision, key in identities}
-        self._connect()
+        allowed = {}
+        grouped: dict[str, set[str]] = {}
+        for record in allowed_versions:
+            knowledge_id, revision, key = _identity(record)
+            source = record.get("ingestion_source", "legacy")
+            self._index_for_source(source)
+            if key in allowed and key not in grouped.get(source, set()):
+                raise KnowledgeIndexError("conflicting knowledge ingestion sources")
+            allowed[key] = (knowledge_id, revision)
+            grouped.setdefault(source, set()).add(key)
+        batches = []
+        for source in grouped:
+            target = self._index_for_source(source)
+            target._connect()
+            keys = sorted(grouped[source])
+            batches.extend((target, keys[start:start + FILTER_BATCH_SIZE])
+                           for start in range(0, len(keys), FILTER_BATCH_SIZE))
         vector = self._embed(query.strip())
         routes: dict[str, dict[str, dict[str, Any]]] = {"text_dense": {}, "text_keyword": {}}
-        keys = sorted(allowed)
         # ponytail: fixed chunk windows can favor long assets; split saturated
         # batches if target-scale tests show parent assets being crowded out.
-        for start in range(0, len(keys), FILTER_BATCH_SIZE):
-            batch_keys = keys[start:start + FILTER_BATCH_SIZE]
-            for route, rows in (("text_dense", self._query(vector, batch_keys, top_k)),
-                                ("text_keyword", self._query_keyword(query.strip(), batch_keys, top_k))):
+        for target, batch_keys in batches:
+            for route, rows in (("text_dense", target._query(vector, batch_keys, top_k)),
+                                ("text_keyword", target._query_keyword(query.strip(), batch_keys, top_k))):
                 results = routes[route]
                 for row in rows:
                     key = row.get("revision_key")

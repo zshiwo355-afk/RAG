@@ -93,6 +93,90 @@ def enqueue(system, key="synthetic-1"):
     return receipt
 
 
+def role_item(system, key, *, shared_source=None, parser_identity=None):
+    from rag_app import knowledge_item_assignments as assignments
+    receipt = enqueue(system, key)
+    if shared_source:
+        with system.store._connection(write=True) as connection:
+            system.store._execute(connection, 'UPDATE knowledge_upload_receipts SET source_id=? WHERE receipt_id=?',
+                                  (shared_source, receipt['receipt_id']))
+    system.store.enqueue_verified()
+    job = system.store.claim()
+    item = {'item_id': uuid4().hex, 'source_path': 'synthetic.md', 'title': key,
+            'knowledge_id': parser_identity or 'ka_' + uuid4().hex,
+            'status': 'needs_review', 'reason_codes': ['unresolved_reference']}
+    entry = {'knowledge_id': item['knowledge_id'], 'title': key, 'kind': 'method',
+             'evidence': {'source_uploader_department': '原部门', 'source_uploader_position': 'SSC',
+                          'source_locator': 'synthetic:stable'}}
+    asset = {'source_path': 'synthetic.md', 'attachment_sha256': []}
+    assignments.context(system.store, job, item, entry, key, asset)
+    system.store.save_item(job, item, system.objects.put(key))
+    return job, item, entry
+
+
+def test_uploader_role_confirmation_is_durable_and_serializes_versions(postgres):
+    system = postgres
+    role = system.catalogue.register_role('共享中心', '流程专员')
+    other = system.catalogue.register_role('运营部', '策划')
+    row, item, _ = role_item(system, 'synthetic-1')
+    system.store.finish(row, 'needs_review')
+    other_job, other_item, _ = role_item(system, 'synthetic-2')
+    system.store.finish(other_job, 'needs_review')
+    assert system.store.get_item_uploader_role(row['job_id'], item['item_id'])['version'] == 0
+
+    def save(selected):
+        try:
+            return system.store.set_item_uploader_role(row['job_id'], item['item_id'], selected['role_id'], 0,
+                                                       actor='reviewer', remember_rule=True)
+        except ProcessingError as error:
+            return error.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(save, [role, other]))
+    saved = next(result for result in outcomes if isinstance(result, dict))
+    assert 'uploader_role_version_conflict' in outcomes
+    assert saved['version'] == 1 and not saved['requeued'] and saved['remembered']
+    restarted = ProcessingStore(database_url=system.url, clock=system.store.clock)
+    assert restarted.get_item_uploader_role(row['job_id'], item['item_id']) == saved
+    selected = role if saved['role']['role_id'] == role['role_id'] else other
+    rejected_alias = other if selected == role else role
+    assert save(selected) == saved
+    # The second item owns its own version, even through the same credential.
+    second = restarted.set_item_uploader_role(other_job['job_id'], other_item['item_id'], rejected_alias['role_id'], 0,
+                                              actor='reviewer', remember_rule=True)
+    assert second['version'] == 1 and second['rule_status'] == 'conflict' and not second['remembered']
+    with restarted._connection() as connection:
+        assert connection.execute('SELECT COUNT(*) AS n FROM knowledge_item_role_assignments').fetchone()['n'] == 2
+        assert connection.execute('SELECT role_id FROM knowledge_role_aliases').fetchone()['role_id'] == selected['role_id']
+        assert connection.execute('SELECT COUNT(*) AS n FROM knowledge_uploader_roles').fetchone()['n'] == 0
+    assert restarted.initialize_role_assignments()['ready']
+
+
+def test_postgres_source_collision_requires_explicit_new_without_overwriting_binding(postgres):
+    from rag_app import knowledge_item_assignments as assignments
+    system = postgres
+    role = system.catalogue.register_role('共享中心', '流程专员')
+    first, first_item, first_entry = role_item(system, 'source-a', shared_source='shared-source', parser_identity='ka_shared')
+    original = assignments.resolve_source(system.store, first, first_item, first_entry)
+    system.store.finish(first, 'needs_review')
+    second, item, entry = role_item(system, 'source-b', shared_source='shared-source', parser_identity='ka_shared')
+    with pytest.raises(ProcessingError, match='source_relation_review'):
+        assignments.resolve_source(system.store, second, item, entry)
+    item['reason_codes'] = ['source_relation_review']
+    system.store.save_item(second, item, system.objects.put('source-b'))
+    system.store.finish(second, 'needs_review')
+    saved = system.store.set_item_uploader_role(second['job_id'], item['item_id'], role['role_id'], 0,
+                                               actor='reviewer', source_action='new')
+    assert saved['requeued']
+    claimed = system.store.claim()
+    replacement = assignments.resolve_source(system.store, claimed, item, entry)
+    assert replacement != original
+    with system.store._connection() as connection:
+        assert assignments.effective_identity(system.store, connection, first_item['item_id'], 'ka_shared') == original
+        assert assignments.effective_identity(system.store, connection, item['item_id'], 'ka_shared') == replacement
+    system.store.finish(claimed, 'needs_review')
+
+
 @pytest.mark.parametrize("old_action", ["finish", "heartbeat"])
 def test_claim_rechecks_row_and_global_slot_after_postgres_lock_wait(postgres, old_action):
     system = postgres
@@ -173,7 +257,8 @@ def test_postgres_idempotency_slot_and_draft_transaction_fence(postgres):
         "SELECT table_name FROM information_schema.tables WHERE table_schema=%s", (system.schema,)).fetchall()}
     assert tables == {"knowledge_upload_receipts", "knowledge_processing_jobs", "knowledge_processing_items",
                       "knowledge_processing_events", "knowledge_assets", "knowledge_revisions",
-                      "knowledge_revision_fingerprints", "knowledge_submissions"}
+                      "knowledge_revision_fingerprints", "knowledge_submissions", "knowledge_roles", "knowledge_uploader_roles",
+                      "knowledge_item_role_assignments", "knowledge_role_aliases", "knowledge_item_source_bindings"}
 
 
 def test_resolution_rechecks_job_after_concurrent_retry_row_lock(postgres):
@@ -217,3 +302,25 @@ def test_resolution_rechecks_job_after_concurrent_retry_row_lock(postgres):
             future.result(timeout=10)
     stored = system.store.item_record(job['job_id'], item['item_id'], None)
     assert stored['status'] == 'needs_review' and stored['version'] == 1
+
+
+def test_tracking_role_summary_and_filters_use_postgres_before_pagination(postgres):
+    system = postgres
+    role = system.catalogue.register_role('共享中心', '流程专员')
+    for number in range(3):
+        system.now[0] = 1000 + number * 100
+        job, item, _ = role_item(system, 'synthetic-tracking-' + str(number))
+        system.store.finish(job, 'needs_review')
+        system.store.set_item_uploader_role(job['job_id'], item['item_id'], role['role_id'], 0, actor='reviewer')
+    for listing in (system.store.list_receipts, system.store.list_jobs):
+        filters = dict(q='synthetic-tracking', department='共享中心', role_id=role['role_id'],
+            processing_status='needs_review', created_from='1970-01-01T00:16:40Z', created_to='1970-01-01T00:20:00Z')
+        pages = [listing('user:synthetic', limit=1, offset=offset, **filters) for offset in (0, 1)]
+        assert all(page['total'] == 2 for page in pages)
+        assert pages[0]['items'][0]['job_id'] != pages[1]['items'][0]['job_id']
+        assert all(page['items'][0]['role_assignments'][0]['role']['role_id'] == role['role_id'] for page in pages)
+        assert listing('other', **filters)['total'] == 0
+    with system.store._connection(write=True) as connection:
+        connection.execute('DROP TABLE knowledge_item_role_assignments')
+    assert system.store.list_jobs('user:synthetic', department='共享中心')['total'] == 0
+    assert system.store.list_receipts('user:synthetic')['total'] == 3

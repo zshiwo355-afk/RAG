@@ -77,6 +77,28 @@ def service(tmp_path):
     return KnowledgeService(KnowledgeStore(tmp_path / "knowledge.sqlite3"), FakeIndex())
 
 
+@pytest.mark.parametrize("automatic", [False, True])
+def test_publication_warms_graph_only_after_commit_and_cache_failure_is_nonfatal(service, monkeypatch, automatic):
+    from rag_app import knowledge_graph
+    calls = []
+
+    def warm(catalog, published):
+        assert catalog.get_published(published["knowledge_id"])["revision"] == published["revision"]
+        assert published["content"] == entry()["content"]
+        calls.append(published["revision"])
+        raise RuntimeError("cache unavailable")
+
+    monkeypatch.setattr(knowledge_graph, "cache_published_features", warm, raising=False)
+    draft = service.import_document(entry(), execute=True)
+    service.publish("decision-review", confirmed_by="test", execute=False)
+    assert not calls
+    if automatic:
+        result = service.publish_automatic("decision-review", 1, expected_generation=draft["generation"], confirmed_by="test")
+    else:
+        result = service.publish("decision-review", confirmed_by="test", execute=True)
+    assert result["status"] == "published" and calls == [1]
+
+
 def test_automatic_publication_atomically_completes_and_recovers_without_republishing(service):
     draft = service.import_document(entry(), execute=True)
     with service.store._connection(write=True) as connection:
@@ -480,7 +502,7 @@ from fastapi import FastAPI
 from rag_app.knowledge_api import router
 app = FastAPI()
 app.include_router(router)
-assert any(route.path == '/api/knowledge/search' for route in app.routes)
+assert 'post' in app.openapi()['paths']['/api/knowledge/search']
 """
     result = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
